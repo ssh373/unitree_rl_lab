@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
+from dataclasses import MISSING
+
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
@@ -70,14 +73,83 @@ class RunningPPORunnerCfg(BasePPORunnerCfg):
 
 
 @configclass
-class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
-    """Running PPO configuration for tasks that expose the ``amp`` observation group.
+class RslRlAmpCfg:
+    """Adversarial Motion Priors settings, consumed by
+    :class:`unitree_rl_lab.algorithms.amp.extension.AMPExtension`."""
 
-    Stage 1 of the AMP integration: the extra observation set is routed through the runner so
-    it lands in the rollout storage and passes through the symmetry augmentation, while the
-    algorithm is still plain PPO. The AMP runner and algorithm (``class_name``,
-    ``algorithm.class_name``) and the discriminator settings are switched on here once the
-    algorithm layer exists.
+    motion_files: list[str] = MISSING
+    """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
+    obs_group: str = "amp"
+    speed_range: tuple[float, float] = (0.2, 2.5)
+    """Planar-speed gate on reference transitions: drop standing still and speeds the task never commands."""
+
+    reward_weight: float = 0.5
+    """Final weight of the style reward; the task rewards keep their baseline weights."""
+    reward_weight_start: float | None = None
+    ramp_start_iter: int = 0
+    ramp_end_iter: int = 0
+    """Linear ramp of the style weight over PPO iterations. Equal start/end iterations disable it."""
+
+    command_name: str | None = "base_velocity"
+    command_gate: float = 0.1
+    """Zero the style reward below this commanded planar speed (standing environments)."""
+
+    hidden_dims: tuple[int, ...] = (1024, 512)
+    activation: str = "relu"
+    normalize_input: bool = True
+    grad_penalty_coef: float = 10.0
+    learning_rate: float = 1.0e-4
+    num_updates_per_iter: int = 10
+    batch_size: int = 4096
+    use_symmetry_augmentation: bool = True
+
+
+@configclass
+class RslRlExtendedPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """PPO algorithm configuration with composable extensions (see ``unitree_rl_lab.algorithms``)."""
+
+    class_name: str = "ExtendedPPO"
+    amp_cfg: RslRlAmpCfg | None = None
+
+
+_LAFAN1_RUN_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "locomotion", "motions", "lafan1_run"
+)
+LAFAN1_RUN_CLIPS = [
+    os.path.join(_LAFAN1_RUN_DIR, f"{name}.npz")
+    for name in ("run1_subject2", "run1_subject5", "run2_subject1", "run2_subject4", "sprint1_subject2", "sprint1_subject4")
+]
+"""LAFAN1 running takes retargeted to G1 (30 fps csv in the same directory; npz built locally)."""
+
+
+@configclass
+class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
+    """Running PPO with an AMP style reward from human running motions (ablation B).
+
+    Identical to :class:`RunningPPORunnerCfg` except that the ``amp`` observation set is routed to
+    the algorithm and PPO is extended with the AMP discriminator. The policy and the task rewards
+    are untouched, so the only difference to the baseline run is the style reward.
     """
 
+    class_name: str = "ExtendedOnPolicyRunner"
     obs_groups = {"policy": ["policy"], "critic": ["critic"], "amp": ["amp"]}
+    algorithm = RslRlExtendedPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=False,
+            data_augmentation_func=compute_g1_29dof_symmetric_states,
+        ),
+        amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_CLIPS),
+    )

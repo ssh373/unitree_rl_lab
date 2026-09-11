@@ -129,12 +129,26 @@ REGISTER_OBSERVATION(gait_phase)
     float period = params["period"].as<float>();
     float delta_phase = env->step_dt * (1.0f / period);
 
+    // The clock always advances (matches the episode-time phase used in training) ...
     env->global_phase += delta_phase;
     env->global_phase = std::fmod(env->global_phase, 1.0f);
 
     std::vector<float> obs(2);
     obs[0] = std::sin(env->global_phase * 2 * M_PI);
     obs[1] = std::cos(env->global_phase * 2 * M_PI);
+
+    // ... but its output is masked to (0, 0) while the velocity command says "stand still",
+    // exactly as mdp.observations.gait_phase does in training. `command_threshold` comes from the
+    // exported deploy.yaml; policies exported without it (or with 0) keep the unmasked clock.
+    // Relies on the velocity command observation being listed before gait_phase in deploy.yaml,
+    // which is the training observation order and fills `velocity_command_b` first.
+    const float command_threshold = params["command_threshold"]
+        ? params["command_threshold"].as<float>() : 0.0f;
+    if (command_threshold > 0.0f && env->robot->data.velocity_command_b.norm() < command_threshold)
+    {
+        obs[0] = 0.0f;
+        obs[1] = 0.0f;
+    }
     return obs;
 }
 

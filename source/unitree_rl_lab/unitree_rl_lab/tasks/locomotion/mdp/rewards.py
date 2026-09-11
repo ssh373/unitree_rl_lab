@@ -186,9 +186,8 @@ def feet_contact_without_cmd(
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
 
-    command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
     reward = torch.sum(is_contact, dim=-1).float()
-    return reward * (command_norm < command_threshold)
+    return reward * _standing_command_mask(env, command_name, command_threshold)
 
 
 def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -210,20 +209,24 @@ Feet Gait rewards.
 """
 
 
+def _standing_command_mask(env: ManagerBasedRLEnv, command_name: str, command_threshold: float) -> torch.Tensor:
+    """1.0 where the velocity command norm is below ``command_threshold`` (stand-still command), else 0.0.
+
+    One rule for the whole task: commands below the threshold mean "stand", at or above mean "run".
+    The gait clock observation, the standing rewards and ``_command_run_gate`` all share it, so there
+    is no command band where neither the standing nor the running terms are active.
+    """
+    command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    return (command_norm < command_threshold).float()
+
+
 def _command_run_gate(
     env: ManagerBasedRLEnv,
     command_name: str,
-    linear_full_speed: float = 0.1,
-    yaw_full_speed: float = 0.2,
+    command_threshold: float = 0.1,
 ) -> torch.Tensor:
-    """Return a smooth run gate for translation and in-place rotation commands."""
-    command = env.command_manager.get_command(command_name)
-    linear_speed = torch.linalg.vector_norm(command[:, :2], dim=1)
-    yaw_speed = torch.abs(command[:, 2])
-
-    linear_gate = torch.clamp(linear_speed / linear_full_speed, min=0.0, max=1.0)
-    yaw_gate = torch.clamp(yaw_speed / yaw_full_speed, min=0.0, max=1.0)
-    return torch.maximum(linear_gate, yaw_gate)
+    """Return 1.0 for running commands (norm >= threshold) and 0.0 for stand-still commands."""
+    return 1.0 - _standing_command_mask(env, command_name, command_threshold)
 
 
 def _gait_leg_phases(

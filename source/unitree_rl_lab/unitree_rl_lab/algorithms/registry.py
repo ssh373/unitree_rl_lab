@@ -14,6 +14,7 @@ import importlib
 RUNNERS: dict[str, str] = {
     "OnPolicyRunner": "rsl_rl.runners:OnPolicyRunner",
     "DistillationRunner": "rsl_rl.runners:DistillationRunner",
+    "ExtendedOnPolicyRunner": "unitree_rl_lab.algorithms.runner:ExtendedOnPolicyRunner",
 }
 """Registered runners as ``name -> "package.module:ClassName"``."""
 

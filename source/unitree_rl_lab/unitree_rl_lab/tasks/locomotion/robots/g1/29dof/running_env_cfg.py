@@ -26,6 +26,11 @@ GAIT_PERIOD = 0.5
 GAIT_OFFSETS = (0.0, 0.5)
 GAIT_STANCE_RATIO = 0.30
 GAIT_FEET_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+# Single stand/run rule for the task: a velocity command with norm below this value means "stand
+# still", at or above it means "run". Shared by the gait clock observation (masked to (0, 0) while
+# standing), the standing rewards/penalties and the run gate of the gait rewards. The deployment
+# code reads the same value from the exported deploy.yaml, so sim and robot agree.
+STAND_CMD_THRESHOLD = 0.1
 
 # Running-specific neutral pose: keep the elbows bent and the arms close to the
 # torso while leaving shoulder pitch available for fore-aft arm swing.
@@ -252,7 +257,7 @@ class CommandsCfg:
         gait_period=GAIT_PERIOD,
         gait_offsets=GAIT_OFFSETS,
         gait_stance_ratio=GAIT_STANCE_RATIO,
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.1,
         rel_heading_envs=1.0,
         heading_command=False,
         debug_vis=True,
@@ -324,7 +329,14 @@ class ObservationsCfg:
             ),
         )
         last_action = ObsTerm(func=mdp.last_action)
-        gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": GAIT_PERIOD})
+        gait_phase = ObsTerm(
+            func=mdp.gait_phase,
+            params={
+                "period": GAIT_PERIOD,
+                "command_name": "base_velocity",
+                "command_threshold": STAND_CMD_THRESHOLD,
+            },
+        )
 
         def __post_init__(self):
             self.history_length = 5
@@ -347,7 +359,14 @@ class ObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         last_action = ObsTerm(func=mdp.last_action)
-        gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": GAIT_PERIOD})
+        gait_phase = ObsTerm(
+            func=mdp.gait_phase,
+            params={
+                "period": GAIT_PERIOD,
+                "command_name": "base_velocity",
+                "command_threshold": STAND_CMD_THRESHOLD,
+            },
+        )
         # height_scanner = ObsTerm(func=mdp.height_scan,
         #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         #     clip=(-1.0, 5.0),
@@ -487,7 +506,7 @@ class RewardsCfg:
         weight=1.0,
         params={
             "command_name": "base_velocity",
-            "command_threshold": 0.01,
+            "command_threshold": STAND_CMD_THRESHOLD,
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=GAIT_FEET_BODY_NAMES
             ),
