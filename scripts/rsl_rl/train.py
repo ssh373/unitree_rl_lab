@@ -98,7 +98,6 @@ import shutil
 import torch
 from datetime import datetime
 
-from rsl_rl.runners import OnPolicyRunner  # TODO: Consider printing the experiment name in the terminal.
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import (
@@ -115,6 +114,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import unitree_rl_lab.tasks  # noqa: F401
+from unitree_rl_lab.algorithms.registry import get_runner_class
 from unitree_rl_lab.utils.export_deploy_cfg import export_deploy_cfg
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -295,8 +295,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    # create runner from rsl-rl; the class is chosen by agent_cfg.class_name (default OnPolicyRunner)
+    runner_class = get_runner_class(agent_cfg.class_name)
+    runner = runner_class(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint

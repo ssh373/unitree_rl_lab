@@ -67,3 +67,17 @@ class RunningPPORunnerCfg(BasePPORunnerCfg):
             data_augmentation_func=compute_g1_29dof_symmetric_states,
         ),
     )
+
+
+@configclass
+class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
+    """Running PPO configuration for tasks that expose the ``amp`` observation group.
+
+    Stage 1 of the AMP integration: the extra observation set is routed through the runner so
+    it lands in the rollout storage and passes through the symmetry augmentation, while the
+    algorithm is still plain PPO. The AMP runner and algorithm (``class_name``,
+    ``algorithm.class_name``) and the discriminator settings are switched on here once the
+    algorithm layer exists.
+    """
+
+    obs_groups = {"policy": ["policy"], "critic": ["critic"], "amp": ["amp"]}

@@ -70,7 +70,6 @@ import gymnasium as gym
 import os
 import torch
 
-from rsl_rl.runners import OnPolicyRunner
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab.utils.assets import retrieve_file_path
@@ -78,6 +77,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
+from unitree_rl_lab.algorithms.registry import get_runner_class
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 JOINT_GROUPS = {
@@ -137,7 +137,8 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    runner_class = get_runner_class(getattr(agent_cfg, "class_name", "OnPolicyRunner"))
+    runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
