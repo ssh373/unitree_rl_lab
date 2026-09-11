@@ -36,6 +36,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument(
+    "--video_all_envs",
+    action="store_true",
+    default=False,
+    help="Record every environment with a static camera instead of following one robot.",
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, choices=tasks, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -117,6 +123,75 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+class TrackingRecordVideo(gym.wrappers.RecordVideo):
+    """Record video while following one asset in x/y with a fixed camera height."""
+
+    def __init__(
+        self,
+        *args,
+        tracked_asset_name: str | None = None,
+        tracked_env_index: int = 0,
+        camera_xy_offset: tuple[float, float] = (2.5, 2.0),
+        camera_height: float = 1.6,
+        lookat_height: float = 0.65,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._tracked_asset_name = tracked_asset_name
+        self._tracked_env_index = tracked_env_index
+        self._camera_xy_offset = camera_xy_offset
+        self._camera_height = camera_height
+        self._lookat_height = lookat_height
+
+    def _capture_frame(self):
+        if self._tracked_asset_name is not None:
+            unwrapped_env = self.env.unwrapped
+            root_xy = (
+                unwrapped_env.scene[self._tracked_asset_name]
+                .data.root_pos_w[self._tracked_env_index, :2]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            terrain_origin_z = float(unwrapped_env.scene.env_origins[self._tracked_env_index, 2].item())
+            camera_eye = (
+                root_xy[0] + self._camera_xy_offset[0],
+                root_xy[1] + self._camera_xy_offset[1],
+                terrain_origin_z + self._camera_height,
+            )
+            camera_target = (
+                root_xy[0],
+                root_xy[1],
+                terrain_origin_z + self._lookat_height,
+            )
+            unwrapped_env.sim.set_camera_view(eye=camera_eye, target=camera_target)
+
+        super()._capture_frame()
+
+
+class WandbRecordVideo(TrackingRecordVideo):
+    """Record training videos locally and upload completed clips to W&B."""
+
+    def stop_recording(self):
+        video_name = self._video_name
+        has_frames = len(self.recorded_frames) > 0
+        super().stop_recording()
+
+        if not has_frames or video_name is None:
+            return
+
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        video_path = os.path.join(self.video_folder, f"{video_name}.mp4")
+        wandb.log(
+            {"Videos/train": wandb.Video(video_path, format="mp4", caption=video_name)},
+            commit=False,
+        )
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -131,6 +206,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    # Detect single-robot recording by capability rather than by task name: any task whose
+    # velocity command exposes debug_vis_env_index is one of the running variants and can
+    # render one robot with a tracking camera. A hard-coded task string silently dropped
+    # this for every new variant of the task (-Reward, -Power, -Torque, ...).
+    _command_cfg = getattr(env_cfg.commands, "base_velocity", None)
+    record_single_running_env = (
+        args_cli.video
+        and not args_cli.video_all_envs
+        and _command_cfg is not None
+        and hasattr(_command_cfg, "debug_vis_env_index")
+    )
+    if args_cli.video:
+        print(
+            f"[INFO] Video: {'single robot with tracking camera' if record_single_running_env else 'all environments, static camera'}"
+        )
+
+    # The recording wrapper follows the robot in x/y. Keep the built-in viewer static so its
+    # asset-root callback does not reintroduce the robot's vertical shake.
+    if record_single_running_env:
+        env_cfg.viewer.origin_type = "env"
+        env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (2.5, 2.0, 1.6)
+        env_cfg.viewer.lookat = (0.0, 0.0, 0.65)
+        env_cfg.commands.base_velocity.debug_vis_env_index = 0
 
     # multi-gpu training configuration
     if args_cli.distributed:
@@ -161,6 +261,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
+    # Keep every environment active for physics and learning, but render only environment 0's robot.
+    if record_single_running_env and env.unwrapped.num_envs > 1:
+        env.unwrapped.scene["robot"].set_visibility(False, env_ids=range(1, env.unwrapped.num_envs))
+
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
@@ -173,9 +277,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
+        if record_single_running_env:
+            video_kwargs.update(
+                {
+                    "tracked_asset_name": "robot",
+                    "tracked_env_index": 0,
+                    "camera_xy_offset": (2.5, 2.0),
+                    "camera_height": 1.6,
+                    "lookat_height": 0.65,
+                }
+            )
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        video_wrapper = WandbRecordVideo if agent_cfg.logger.lower() == "wandb" else TrackingRecordVideo
+        env = video_wrapper(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)

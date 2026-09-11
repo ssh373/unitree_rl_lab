@@ -59,3 +59,34 @@ def ang_vel_cmd_levels(
             ).tolist()
 
     return torch.tensor(ranges.ang_vel_z[1], device=env.device)
+
+
+def reward_weight_linear_schedule(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    start_step: int,
+    end_step: int,
+) -> torch.Tensor:
+    """Linearly interpolate a reward term's weight between two global step counts.
+
+    ``isaaclab.envs.mdp.modify_reward_weight`` switches the weight in one jump, which makes
+    a strong cost penalty arrive as a step change in the advantage scale. Ramping instead
+    lets the gait settle under the task rewards first and then trades it down for
+    efficiency, which is what keeps the running gait alive.
+
+    Note that ``start_step``/``end_step`` count environment steps, i.e. PPO iteration
+    multiplied by ``num_steps_per_env``.
+    """
+    if end_step <= start_step:
+        raise ValueError(f"end_step ({end_step}) must be greater than start_step ({start_step}).")
+
+    alpha = (env.common_step_counter - start_step) / (end_step - start_step)
+    alpha = min(max(alpha, 0.0), 1.0)
+
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    term_cfg.weight = start_weight + alpha * (end_weight - start_weight)
+
+    return torch.tensor(term_cfg.weight, device=env.device)

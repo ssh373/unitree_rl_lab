@@ -20,6 +20,16 @@ public:
                 lowcmd->msg_.motor_cmd()[i].mode() = values[i];
             }
         }
+        
+        registered_checks.emplace_back(
+	    std::make_pair(
+		[]()->bool {
+		    return FSMState::keyboard &&
+		           FSMState::keyboard->key() == "1";
+		},
+		FSMStringMap.right.at("FixStand")
+	    )
+	);
     } 
 
     void enter()

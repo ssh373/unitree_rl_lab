@@ -6,6 +6,10 @@
 #include "FSMState.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 #include "isaaclab/envs/mdp/terminations.h"
+#include <unitree/dds_wrapper/robots/go2/go2_sub.h>
+#include <algorithm>
+#include <cmath>
+#include <thread>
 
 class State_RLBase : public FSMState
 {
@@ -39,6 +43,14 @@ public:
             {
                 env->step();
 
+                const long velocity_log_interval = std::max(
+                    1L, static_cast<long>(std::lround(0.5 / env->step_dt))
+                );
+                if (env->episode_length % velocity_log_interval == 0)
+                {
+                    log_velocity();
+                }
+
                 // Sleep
                 std::this_thread::sleep_until(sleepTill);
                 sleepTill += dt;
@@ -57,7 +69,10 @@ public:
     }
 
 private:
+    void log_velocity();
+
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> env;
+    std::shared_ptr<unitree::robot::go2::subscription::SportModeState> highstate;
 
     std::thread policy_thread;
     bool policy_thread_running = false;

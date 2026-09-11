@@ -15,6 +15,16 @@ public:
         ts_ = param::config["FSM"]["FixStand"]["ts"].as<std::vector<float>>();
         qs_ = param::config["FSM"]["FixStand"]["qs"].as<std::vector<std::vector<float>>>();
         assert(ts_.size() == qs_.size());
+        
+        registered_checks.emplace_back(
+	    std::make_pair(
+		[]()->bool {
+		    return FSMState::keyboard &&
+		           FSMState::keyboard->key() == "2";
+		},
+		FSMStringMap.right.at("Velocity")
+	    )
+	);
     }
 
     void enter()

@@ -31,6 +31,9 @@ struct ArticulationData
     // Root angular velocity in base world frame.
     Eigen::Vector3f root_ang_vel_b;
 
+    // Latest velocity command consumed by the policy: vx, vy, yaw rate.
+    Eigen::Vector3f velocity_command_b = Eigen::Vector3f::Zero();
+
     // Projection of the gravity direction on base frame.
     Eigen::Vector3f projected_gravity_b;
 

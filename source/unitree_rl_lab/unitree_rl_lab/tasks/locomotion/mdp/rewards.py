@@ -28,6 +28,42 @@ def energy(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("r
     return torch.sum(torch.abs(qvel) * torch.abs(qfrc), dim=-1)
 
 
+def joint_power_l1(
+    env: ManagerBasedRLEnv,
+    power_ref: float = 500.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Mechanical joint power ``sum |tau * qdot|`` normalized by a reference power.
+
+    Same quantity as :func:`energy`, but divided by ``power_ref`` (in Watt) so the term
+    stays O(1) and its weight is directly comparable with the tracking rewards. Calibrate
+    ``power_ref`` from the ``Metrics/base_velocity/energy/mech_power_w`` diagnostic logged
+    by the velocity command term.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    qvel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    qfrc = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(qvel * qfrc), dim=-1) / power_ref
+
+
+def joint_torque_normalized_l2(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Squared joint torque normalized by each actuator's effort limit.
+
+    This covers the resistive (``I^2 R``) share of the electrical cost that mechanical
+    power misses: holding a load at zero joint velocity draws no ``tau * qdot`` but still
+    heats the motor. Normalizing by the effort limit keeps the 25 Nm ankles and the
+    139 Nm knees on the same scale, so one weight covers the whole body.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    torque = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    limit = asset.data.joint_effort_limits[:, asset_cfg.joint_ids].clamp_min(1e-6)
+    return torch.sum(torch.square(torque / limit), dim=-1)
+
+
 def stand_still(
     env: ManagerBasedRLEnv, command_name: str = "base_velocity", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -138,7 +174,10 @@ def feet_too_near(
 
 
 def feet_contact_without_cmd(
-    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str = "base_velocity"
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.1,
 ) -> torch.Tensor:
     """
     Reward for feet contact when the command is zero.
@@ -149,7 +188,7 @@ def feet_contact_without_cmd(
 
     command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
     reward = torch.sum(is_contact, dim=-1).float()
-    return reward * (command_norm < 0.1)
+    return reward * (command_norm < command_threshold)
 
 
 def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -169,6 +208,109 @@ def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
 """
 Feet Gait rewards.
 """
+
+
+def _command_run_gate(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    linear_full_speed: float = 0.1,
+    yaw_full_speed: float = 0.2,
+) -> torch.Tensor:
+    """Return a smooth run gate for translation and in-place rotation commands."""
+    command = env.command_manager.get_command(command_name)
+    linear_speed = torch.linalg.vector_norm(command[:, :2], dim=1)
+    yaw_speed = torch.abs(command[:, 2])
+
+    linear_gate = torch.clamp(linear_speed / linear_full_speed, min=0.0, max=1.0)
+    yaw_gate = torch.clamp(yaw_speed / yaw_full_speed, min=0.0, max=1.0)
+    return torch.maximum(linear_gate, yaw_gate)
+
+
+def _gait_leg_phases(
+    env: ManagerBasedRLEnv, period: float, offset: list[float] | tuple[float, ...]
+) -> torch.Tensor:
+    """Compute each leg's normalized phase in the interval [0, 1)."""
+    global_phase = ((env.episode_length_buf * env.step_dt) % period / period).unsqueeze(1)
+    offsets = torch.as_tensor(offset, dtype=torch.float, device=env.device).unsqueeze(0)
+    return (global_phase + offsets) % 1.0
+
+
+def run_contact_pattern(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float] | tuple[float, ...],
+    stance_ratio: float,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Reward the exact running contact state: single support alternating with flight."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    leg_phase = _gait_leg_phases(env, period, offset)
+
+    if leg_phase.shape[1] != is_contact.shape[1]:
+        raise ValueError("The number of gait offsets must match the number of configured feet.")
+
+    expected_contact = leg_phase < stance_ratio
+    exact_match = torch.all(expected_contact == is_contact, dim=1).float()
+    return exact_match * _command_run_gate(env, command_name)
+
+
+def short_contact_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    max_contact_time: float,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Penalize foot contacts that last longer than the running stance target."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+
+    # Normalize the excess so the configured reward weight remains meaningful in seconds.
+    normalized_excess = torch.clamp(contact_time / max_contact_time - 1.0, min=0.0, max=1.0)
+    penalty = torch.sum(torch.square(normalized_excess), dim=1)
+    return penalty * _command_run_gate(env, command_name)
+
+
+def push_off_reward(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float] | tuple[float, ...],
+    stance_ratio: float,
+    target_vz: float,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    max_target_vz: float | None = None,
+    target_speed: float = 2.0,
+    late_stance_start: float = 0.6,
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward upward base velocity while the stance foot is preparing for takeoff."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    leg_phase = _gait_leg_phases(env, period, offset)
+
+    if leg_phase.shape[1] != is_contact.shape[1]:
+        raise ValueError("The number of gait offsets must match the number of configured feet.")
+
+    late_stance = torch.logical_and(
+        leg_phase >= stance_ratio * late_stance_start,
+        leg_phase < stance_ratio,
+    )
+    active_push_off = torch.any(late_stance & is_contact, dim=1).float()
+
+    target_vz_tensor = torch.full((env.num_envs,), target_vz, device=env.device)
+    if max_target_vz is not None:
+        command = env.command_manager.get_command(command_name)
+        planar_speed = torch.linalg.vector_norm(command[:, :2], dim=1)
+        speed_ratio = torch.clamp(planar_speed / target_speed, min=0.0, max=1.0)
+        target_vz_tensor += (max_target_vz - target_vz) * speed_ratio
+
+    base_vz = asset.data.root_lin_vel_w[:, 2]
+    push_off_quality = torch.exp(-torch.square((base_vz - target_vz_tensor) / std))
+    return push_off_quality * active_push_off * _command_run_gate(env, command_name)
 
 
 def feet_gait(
@@ -196,7 +338,7 @@ def feet_gait(
 
     if command_name is not None:
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
-        reward *= cmd_norm > 0.1
+        reward *= cmd_norm > 0.05
     return reward
 
 

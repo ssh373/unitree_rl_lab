@@ -119,6 +119,8 @@ REGISTER_OBSERVATION(velocity_commands)
     obs[1] = std::clamp(-joystick->lx(), cfg["lin_vel_y"][0].as<float>(), cfg["lin_vel_y"][1].as<float>());
     obs[2] = std::clamp(-joystick->rx(), cfg["ang_vel_z"][0].as<float>(), cfg["ang_vel_z"][1].as<float>());
 
+    env->robot->data.velocity_command_b << obs[0], obs[1], obs[2];
+
     return obs;
 }
 
