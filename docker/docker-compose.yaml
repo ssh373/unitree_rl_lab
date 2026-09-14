@@ -15,6 +15,8 @@ x-unitree-rl-lab-environment: &unitree-rl-lab-environment
   # The repository is bind-mounted and the container runs as root: without this, the container's
   # python leaves root-owned __pycache__ files in the host checkout (undeletable without sudo).
   - PYTHONDONTWRITEBYTECODE=1
+  # Headless camera rendering (--video) needs the graphics driver libraries, not just compute.
+  - NVIDIA_DRIVER_CAPABILITIES=all
 
 x-unitree-rl-lab-deploy: &unitree-rl-lab-deploy
   resources:

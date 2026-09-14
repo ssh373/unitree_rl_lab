@@ -59,8 +59,12 @@ RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install --no-cache-dir \
 
 # The base image starts Isaac Sim headless by default; this image is driven by explicit
 # commands instead (see docker/README.md).
-ENTRYPOINT []
-CMD ["bash"]
+# Symlinked (not copied) so that in the dev image, where the repo is bind-mounted, editing
+# docker/entrypoint.sh on the host takes effect without a rebuild.
+RUN ln -sf ${UNITREE_RL_LAB_PATH}/docker/entrypoint.sh /usr/local/bin/unitree-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/unitree-entrypoint"]
+CMD []
 WORKDIR ${UNITREE_RL_LAB_PATH}
 
 

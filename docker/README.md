@@ -356,23 +356,57 @@ API가 조금씩 다르니 바꾼 뒤에는 학습 한 번을 짧게 돌려 확�
 
 ## 공용 서버(sudo 없음)에서 돌리기
 
-컨테이너는 root로 돌기 때문에 `logs/` 아래 파일이 호스트에서 root 소유가 됩니다. sudo가 없는 서버에서는
-그 파일을 옮기거나 지울 수 없으므로, 학습 명령을 `docker/train.sh`로 감싸 종료 시 내 uid/gid로 소유자를
-되돌립니다(학습이 실패하거나 중단되어도 실행됨). tmux 안에서 포그라운드로 두면 됩니다.
+컨테이너는 root로 돌아야 합니다(이미지의 `/isaac-sim`이 `drwxr-x---`라 `--user`로는 실행조차 되지 않습니다).
+그래서 이미지 ENTRYPOINT(`docker/entrypoint.sh`)가 명령이 끝날 때 `logs/`, `wandb/`, `outputs/`의 소유자를
+호스트 사용자로 되돌립니다. 대상 uid는 바인드 마운트된 체크아웃(개발용) 또는 `logs/`(self-contained)의
+소유자에서 읽으므로 **추가 플래그가 필요 없습니다**. 학습이 실패하거나 중단되어도 실행됩니다.
+아래처럼 평소 명령을 그대로 쓰면 되고, `docker/train.sh $(id -u) $(id -g) ...`로 uid를 명시해도 됩니다.
 
 ```bash
 # 개발용 이미지(코드 바인드 마운트) — 서버에 저장소·로봇 모델이 있고 외부 네트워크가 열린 경우
 docker compose -f docker/docker-compose.yaml run --rm unitree-rl-lab \
-  docker/train.sh $(id -u) $(id -g) --task Unitree-G1-29dof-Running --max_iterations 30000
+  ./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Running --max_iterations 30000
 
 # self-contained 이미지 — 서버에 네트워크가 없거나 저장소를 두지 않을 경우(logs만 마운트)
 docker run --rm --gpus all -e OMNI_KIT_ALLOW_ROOT=1 \
   -v $HOME/rl_logs:/workspace/unitree_rl_lab/logs \
   unitree-rl-lab:2.3.2-selfcontained \
-  docker/train.sh $(id -u) $(id -g) --task Unitree-G1-29dof-Running --max_iterations 30000
+  ./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Running --max_iterations 30000
 ```
 
 - wandb 로거를 쓰면 `-e WANDB_API_KEY=...`를 넘기고, 외부 네트워크가 없으면 `-e WANDB_MODE=offline`으로
   돌린 뒤 `wandb/offline-run-*` 디렉터리를 로그와 함께 옮겨 나중에 `wandb sync` 합니다.
 - 서버 전제: `docker ps`가 되고(docker 그룹), `docker info | grep -i nvidia`에 런타임이 보여야 합니다.
 - 이미지에는 `wandb`, `matplotlib`이 추가로 설치되어 있습니다(`scripts/rsl_rl/train.py`, `plot_energy.py`).
+
+### 학습 영상을 wandb에 올리기 (`--video`)
+
+컨테이너에서 헤드리스 카메라 렌더링과 `WandbRecordVideo` 업로드가 동작하는 것을 확인했습니다
+(`NVIDIA_DRIVER_CAPABILITIES=all`은 compose에 들어 있음). wandb 인증은 호스트의 `~/.netrc`를 읽기 전용으로
+마운트하거나 `-e WANDB_API_KEY=...`로 넘깁니다. 프로젝트는 `--log_project_name`으로 지정합니다(기본 `isaaclab`).
+
+```bash
+docker compose -f docker/docker-compose.yaml run --rm \
+  -v $HOME/.netrc:/root/.netrc:ro \
+  unitree-rl-lab ./unitree_rl_lab.sh -t \
+  --task Unitree-G1-29dof-Running-Torque --max_iterations 30000 \
+  --logger wandb --log_project_name isaaclab \
+  --video --video_interval 4800 --video_length 500
+```
+
+- `--video_interval`/`--video_length`는 환경 스텝 단위입니다(1 이터레이션 = 24 스텝). 지금까지의 러닝 실행은
+  모두 4800/500을 썼습니다: 200 이터레이션마다 10초 클립이 `logs/.../videos/train/`에 저장되고 wandb의
+  `Videos/train`에 올라갑니다(30000 이터레이션에 150개). train.py 기본값(2000/200)과 다르니 명시하세요.
+- rsl_rl의 wandb 로거는 체크포인트(`model_*.pt`)도 wandb 실행 디렉터리에 복사합니다. 런당 수 GB가 `wandb/` 아래에
+  쌓이므로 self-contained 이미지에서는 **`wandb/`도 반드시 마운트**해야 컨테이너 종료 시 사라지지 않습니다
+  (`-v $HOME/rl_wandb:/workspace/unitree_rl_lab/wandb`). 오프라인 모드(`WANDB_MODE=offline`)에서는 이 디렉터리를
+  나중에 `wandb sync`하면 됩니다. `train.sh`가 종료 시 `wandb/`의 소유자도 되돌립니다.
+
+### 이미 root 소유가 된 로그 되돌리기
+
+ENTRYPOINT가 들어가기 전에 돌린 실행이 남긴 root 소유 파일은 컨테이너 안에서 한 번 정리하면 됩니다.
+
+```bash
+docker compose -f docker/docker-compose.yaml run --rm --entrypoint bash unitree-rl-lab \
+  -c "chown -R $(id -u):$(id -g) logs wandb"
+```
