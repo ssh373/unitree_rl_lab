@@ -50,9 +50,13 @@ COPY . ${UNITREE_RL_LAB_PATH}
 
 # Install the extension into the python environment that ships with Isaac Sim / Isaac Lab.
 # `isaaclab.sh -p` resolves to that interpreter; ISAACLAB_PATH is set by the base image.
+# The base image ships wandb 0.24.0, which was yanked from PyPI: runs logged with it can silently
+# fail to upload data. A plain `pip install wandb` would see it as already satisfied, so the floor
+# is required to force the upgrade.
 RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install --no-cache-dir \
         -e ${UNITREE_RL_LAB_PATH}/source/unitree_rl_lab \
-        argcomplete wandb matplotlib \
+        argcomplete matplotlib \
+        "wandb>=0.24.1" \
     && ${ISAACLAB_PATH}/isaaclab.sh -p -c "import unitree_rl_lab, argcomplete, prettytable, psutil; print('[OK] unitree_rl_lab installed')" \
     # task-name autocompletion for ./unitree_rl_lab.sh in interactive shells
     && echo "source ${UNITREE_RL_LAB_PATH}/unitree_rl_lab.sh" >> ${HOME}/.bashrc
