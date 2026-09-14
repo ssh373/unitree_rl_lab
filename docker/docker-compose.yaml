@@ -1,7 +1,22 @@
-x-default-isaac-lab-template-environment: &default-isaac-lab-template-environment
-  - OMNI_KIT_ALLOW_ROOT=1
+# Docker Compose definition for unitree_rl_lab.
+#
+# Run from the repository root:
+#   docker compose -f docker/docker-compose.yaml build
+#   docker compose -f docker/docker-compose.yaml run --rm unitree-rl-lab
+#
+# Every ${VAR:-default} below can be overridden from the shell or from `docker/.env`
+# (copy `docker/.env.base` to `docker/.env` and edit it). Note that `env_file:` would only
+# affect the container's runtime environment, NOT the variable substitution used here.
 
-x-default-isaac-lab-template-deploy: &default-isaac-lab-template-deploy
+x-unitree-rl-lab-environment: &unitree-rl-lab-environment
+  - OMNI_KIT_ALLOW_ROOT=1
+  - ACCEPT_EULA=Y
+  - PRIVACY_CONSENT=Y
+  # The repository is bind-mounted and the container runs as root: without this, the container's
+  # python leaves root-owned __pycache__ files in the host checkout (undeletable without sudo).
+  - PYTHONDONTWRITEBYTECODE=1
+
+x-unitree-rl-lab-deploy: &unitree-rl-lab-deploy
   resources:
     reservations:
       devices:
@@ -10,24 +25,105 @@ x-default-isaac-lab-template-deploy: &default-isaac-lab-template-deploy
           capabilities: [ gpu ]
 
 services:
-  isaac-lab-template:
-    env_file: .env.base
+  unitree-rl-lab:
     build:
       context: ../
       dockerfile: docker/Dockerfile
+      target: base
       args:
-        - ISAACLAB_BASE_IMAGE_ARG=${ISAACLAB_BASE_IMAGE}
-        - DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH_ARG=${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}
-    image: isaac-lab-template
-    container_name: isaac-lab-template
+        - ISAACLAB_BASE_IMAGE_ARG=${ISAACLAB_BASE_IMAGE:-nvcr.io/nvidia/isaac-lab:2.3.2}
+        - DOCKER_UNITREE_RL_LAB_PATH_ARG=${DOCKER_UNITREE_RL_LAB_PATH:-/workspace/unitree_rl_lab}
+    image: ${UNITREE_RL_LAB_IMAGE:-unitree-rl-lab:2.3.2}
+    container_name: unitree-rl-lab
+    environment: *unitree-rl-lab-environment
+    deploy: *unitree-rl-lab-deploy
+    network_mode: host
     volumes:
+      # The repository itself: edits on the host are visible immediately inside the container.
       - type: bind
         source: ../
-        target: ${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}
-    network_mode: host
-    environment: *default-isaac-lab-template-environment
-    deploy: *default-isaac-lab-template-deploy
-    # This is the entrypoint for the container
-    entrypoint: bash
+        target: ${DOCKER_UNITREE_RL_LAB_PATH:-/workspace/unitree_rl_lab}
+      # Unitree robot description files (see docker/README.md).
+      - type: bind
+        source: ${UNITREE_MODEL_HOST_DIR:-${HOME}/unitree_model}
+        target: /workspace/unitree_model
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ${UNITREE_ROS_HOST_DIR:-${HOME}/unitree_ros}
+        target: /workspace/unitree_ros
+        bind:
+          create_host_path: true
+      # Persistent Isaac Sim / Omniverse caches, so shaders etc. are not recompiled on every run.
+      - type: volume
+        source: isaac-cache-kit
+        target: /isaac-sim/kit/cache
+      - type: volume
+        source: isaac-cache-ov
+        target: /root/.cache/ov
+      - type: volume
+        source: isaac-cache-pip
+        target: /root/.cache/pip
+      - type: volume
+        source: isaac-cache-gl
+        target: /root/.cache/nvidia/GLCache
+      - type: volume
+        source: isaac-cache-compute
+        target: /root/.nv/ComputeCache
+      - type: volume
+        source: isaac-logs
+        target: /root/.nvidia-omniverse/logs
+      - type: volume
+        source: isaac-data
+        target: /root/.local/share/ov/data
+    # No entrypoint override: the image's CMD is `bash`, so `docker compose run --rm <service>`
+    # gives a shell and `docker compose run --rm <service> <cmd...>` runs <cmd...> directly.
     stdin_open: true
     tty: true
+
+  # Self-contained variant: robot description files and the Isaac cloud assets are baked
+  # into the image, nothing is bind-mounted except the log directory, and it runs offline.
+  #   docker compose -f docker/docker-compose.yaml build unitree-rl-lab-selfcontained
+  #   docker compose -f docker/docker-compose.yaml run --rm unitree-rl-lab-selfcontained
+  unitree-rl-lab-selfcontained:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile
+      target: full
+      args:
+        - ISAACLAB_BASE_IMAGE_ARG=${ISAACLAB_BASE_IMAGE:-nvcr.io/nvidia/isaac-lab:2.3.2}
+        - DOCKER_UNITREE_RL_LAB_PATH_ARG=${DOCKER_UNITREE_RL_LAB_PATH:-/workspace/unitree_rl_lab}
+        - ASSETS_SOURCE=${ASSETS_SOURCE:-clone}
+    image: ${UNITREE_RL_LAB_SELFCONTAINED_IMAGE:-unitree-rl-lab:2.3.2-selfcontained}
+    container_name: unitree-rl-lab-selfcontained
+    environment: *unitree-rl-lab-environment
+    deploy: *unitree-rl-lab-deploy
+    volumes:
+      # Only the training output leaves the container.
+      - type: bind
+        source: ../logs
+        target: ${DOCKER_UNITREE_RL_LAB_PATH:-/workspace/unitree_rl_lab}/logs
+        bind:
+          create_host_path: true
+      - type: volume
+        source: isaac-cache-kit
+        target: /isaac-sim/kit/cache
+      - type: volume
+        source: isaac-cache-gl
+        target: /root/.cache/nvidia/GLCache
+      - type: volume
+        source: isaac-cache-compute
+        target: /root/.nv/ComputeCache
+    # No entrypoint override: the image's CMD is `bash`, so `docker compose run --rm <service>`
+    # gives a shell and `docker compose run --rm <service> <cmd...>` runs <cmd...> directly.
+    stdin_open: true
+    tty: true
+
+volumes:
+  isaac-cache-kit:
+  isaac-cache-ov:
+  isaac-cache-pip:
+  isaac-cache-gl:
+  isaac-cache-compute:
+  isaac-logs:
+  isaac-data:

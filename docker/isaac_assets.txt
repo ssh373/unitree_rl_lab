@@ -1,0 +1,15 @@
+# Isaac Sim / Isaac Lab assets that the unitree_rl_lab tasks fetch from the
+# NVIDIA asset server at run time. Paths are relative to the asset root
+# (https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/<version>).
+# Mirroring them locally is what makes the container able to run without network access.
+#
+# Command / marker visualisation (isaaclab.markers.config)
+Isaac/Props/UIElements/arrow_x.usd
+Isaac/Props/UIElements/frame_prim.usd
+# Terrain material used by the locomotion tasks (MdlFileCfg) and its textures
+Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl
+Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned001_COL_8K.jpg
+Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned001_GLOSS_8K.jpg
+Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned001_NRM_8K.png
+# Sky texture used by the dome light in every task
+Isaac/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr

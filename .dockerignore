@@ -21,3 +21,12 @@ recordings/
 **/*.egg-info/
 # ignore isaac sim symlink
 _isaac_sim?
+# ignore robot description files placed inside the repo (mount them instead, see docker/README.md)
+unitree_model/
+unitree_ros/
+# ignore compiled deploy controllers
+deploy/**/build/
+# ignore user-specific compose settings
+docker/.env
+# ignore local wandb run cache (GBs; never needed in the image)
+wandb/

@@ -4,6 +4,9 @@ export UNITREE_RL_LAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/nul
 
 if ! [[ -z "${CONDA_PREFIX}" ]]; then
     python_exe=${CONDA_PREFIX}/bin/python
+elif [[ -x "${ISAACLAB_PATH}/_isaac_sim/python.sh" ]]; then
+    # no conda env: fall back to the python bundled with Isaac Lab / Isaac Sim (e.g. inside docker)
+    python_exe=${ISAACLAB_PATH}/_isaac_sim/python.sh
 else
     echo "[Error] No conda environment activated. Please activate the conda environment first."
     # exit 1
