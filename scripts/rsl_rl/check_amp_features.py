@@ -28,6 +28,7 @@ Example:
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import sys
 
 from isaaclab.app import AppLauncher
 
@@ -46,7 +47,9 @@ parser.add_argument("--random_policy", action="store_true", default=False,
                     help="Skip loading a checkpoint and act randomly (useful before any policy exists).")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args()
+args_cli, hydra_args = parser.parse_known_args()
+# clear out sys.argv for Hydra
+sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -83,6 +86,10 @@ def _block_stats(features: torch.Tensor) -> list[tuple[str, torch.Tensor, torch.
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    # The checkpoint usually comes from the *baseline* task, whose log directory differs from this one's.
+    if args_cli.experiment_name:
+        agent_cfg.experiment_name = args_cli.experiment_name
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     # Flat ground and no pushes: differences should come from the gait, not from the terrain.

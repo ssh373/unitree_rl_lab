@@ -73,6 +73,19 @@ FEATURE_DIM = FRAME_DIM * AMP_HISTORY_LENGTH
 ROOT_BODY_INDEX = 0
 GRAVITY_VEC_W = (0.0, 0.0, -1.0)
 
+# Offset of the base_lin_vel(t) block: base_lin_vel is the first term, and its (t-1) sample comes first.
+_LIN_VEL_T_OFFSET = AMP_TERM_DIMS[0][1]
+
+
+def transition_speed(features: torch.Tensor) -> torch.Tensor:
+    """Planar speed of the current frame of each transition, from the ``base_lin_vel(t)`` block.
+
+    Used on both the policy and the reference side of the discriminator batch, so speed matching
+    compares like with like. The base frame is close to level while running, so this is within a
+    few percent of the world-frame planar speed the gate uses.
+    """
+    return torch.linalg.vector_norm(features[:, _LIN_VEL_T_OFFSET : _LIN_VEL_T_OFFSET + 2], dim=-1)
+
 
 def quat_apply_inverse(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     """Rotate ``vec`` by the inverse of ``quat`` (w, x, y, z), matching ``isaaclab.utils.math``.
@@ -129,6 +142,7 @@ class AmpMotionData:
         self._clips: list[dict[str, np.ndarray]] = []
         self.clip_stats: list[ClipStats] = []
         self._features: torch.Tensor | None = None
+        self._speeds: torch.Tensor | None = None
 
         import os
 
@@ -203,7 +217,11 @@ class AmpMotionData:
                 f"The speed gate {self.speed_range} removed every transition in "
                 f"{len(self.motion_files)} clip(s). Widen the range or check the motion files."
             )
-        self._features = features.to(self.device)
+        # Sorted by speed so that speed-matched sampling is a pair of searchsorted calls.
+        speeds = transition_speed(features)
+        order = torch.argsort(speeds)
+        self._features = features[order].to(self.device)
+        self._speeds = speeds[order].to(self.device)
         # The raw arrays are no longer needed once the features exist.
         self._clips = []
 
@@ -257,6 +275,42 @@ class AmpMotionData:
         idx = torch.randint(0, features.shape[0], (batch_size,), device=features.device)
         return features[idx]
 
+    def sample_matched(self, speeds: torch.Tensor, window: float) -> torch.Tensor:
+        """Draw one reference transition per entry of ``speeds``, each within ``±window`` m/s of it.
+
+        Without this the discriminator is shown the clips' own speed distribution (mostly 1-2 m/s)
+        against whatever the policy is currently commanded, and it separates the two sides on
+        ``base_lin_vel`` alone -- the style reward then simply says "run faster". Matching the
+        reference speed to each policy transition removes speed as a cue, so the discriminator has
+        to judge *how* the body moves at that speed. Speed tracking stays the task reward's job.
+
+        Where the clips have no transition inside the window (below ~0.3 m/s in the running takes)
+        the nearest neighbours by speed are used instead, so coverage gaps degrade gracefully
+        rather than raising.
+        """
+        features = self.features
+        ref = self._speeds
+        speeds = speeds.to(ref.device)
+        lo = torch.searchsorted(ref, speeds - window)
+        hi = torch.searchsorted(ref, speeds + window, right=True)
+        empty = hi <= lo
+        if empty.any():
+            pos = torch.searchsorted(ref, speeds[empty])
+            lo[empty] = (pos - 1).clamp(min=0)
+            hi[empty] = (pos + 1).clamp(max=ref.shape[0])
+        u = torch.rand(speeds.shape[0], device=ref.device)
+        idx = (lo + (u * (hi - lo).to(u.dtype)).long()).clamp(max=ref.shape[0] - 1)
+        return features[idx]
+
+    def speed_coverage(self, edges=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 2.5)) -> str:
+        """Share of reference transitions per speed bin -- the bins speed matching can draw from."""
+        speeds = self._speeds.cpu()
+        counts = torch.histogram(speeds, bins=torch.tensor(edges, dtype=speeds.dtype)).hist
+        n = max(int(speeds.numel()), 1)
+        return "  speed coverage: " + "  ".join(
+            f"{lo:.1f}-{hi:.1f}: {int(c):5d} ({c / n * 100:4.1f}%)" for lo, hi, c in zip(edges[:-1], edges[1:], counts)
+        )
+
     def describe(self) -> str:
         """One line per clip plus a total, for the training log."""
         lines = [f"AMP reference data: {len(self.clip_stats)} clip(s), speed gate {self.speed_range} m/s"]
@@ -268,6 +322,8 @@ class AmpMotionData:
         kept = sum(s.kept_pairs for s in self.clip_stats)
         total = sum(s.total_pairs for s in self.clip_stats)
         lines.append(f"  {'TOTAL':<20} {'':7}   {'':14}  kept {kept:6d}/{total:6d} ({kept / max(total, 1) * 100:4.1f}%)")
+        if self._speeds is not None:
+            lines.append(self.speed_coverage())
         return "\n".join(lines)
 
 

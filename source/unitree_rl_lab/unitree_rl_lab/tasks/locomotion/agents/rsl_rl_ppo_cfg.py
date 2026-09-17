@@ -82,13 +82,21 @@ class RslRlAmpCfg:
     obs_group: str = "amp"
     speed_range: tuple[float, float] = (0.2, 2.5)
     """Planar-speed gate on reference transitions: drop standing still and speeds the task never commands."""
+    speed_matched_sampling: bool = True
+    speed_match_window: float = 0.1
+    """Pair every policy transition shown to the discriminator with a reference transition within
+    ``±speed_match_window`` m/s of its speed, so the discriminator cannot separate the two sides by speed
+    (first run with uniform sampling and weight 0.5 ran at 0.7 m/s regardless of a 0.2 m/s command)."""
 
-    reward_weight: float = 0.5
+    reward_weight: float = 0.2
     """Final weight of the style reward; the task rewards keep their baseline weights."""
-    reward_weight_start: float | None = None
+    reward_weight_start: float = 0.0
     ramp_start_iter: int = 0
     ramp_end_iter: int = 0
-    """Linear ramp of the style weight over PPO iterations. Equal start/end iterations disable it."""
+    """Linear ramp of the style weight from ``reward_weight_start`` to ``reward_weight`` over PPO iterations.
+    Equal start/end iterations disable it (the weight is then ``reward_weight`` throughout). Kept as a plain
+    float rather than ``float | None`` so Hydra overrides (``agent.algorithm.amp_cfg.ramp_end_iter=...``) pass
+    the config type check."""
 
     command_name: str | None = "base_velocity"
     command_gate: float = 0.1
@@ -120,6 +128,12 @@ LAFAN1_RUN_CLIPS = [
     for name in ("run1_subject2", "run1_subject5", "run2_subject1", "run2_subject4", "sprint1_subject2", "sprint1_subject4")
 ]
 """LAFAN1 running takes retargeted to G1 (30 fps csv in the same directory; npz built locally)."""
+
+LAFAN1_RUN_SINGLE_CLIP = [os.path.join(_LAFAN1_RUN_DIR, "run1_subject5.npz")]
+"""Single-clip option: the take with the fewest idle frames (3%) and the highest share inside the command
+range (89% within 0.2-2.5 m/s). Not the default: with speed-matched sampling the discriminator needs
+reference data at every speed the policy visits, and this clip has almost none below 0.6 m/s (5%, mostly
+accelerations), whereas the six clips together have 23% there."""
 
 
 @configclass

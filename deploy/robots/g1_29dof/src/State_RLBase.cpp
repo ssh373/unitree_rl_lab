@@ -108,6 +108,123 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
             FSMStringMap.right.at("Passive")
         )
     );
+
+    // sim2real motor protection replica (see motor_limits_exceeded)
+    if(auto protect = cfg["protect"])
+    {
+        if(protect["torque_limit"]) protect_tau_limit_ = protect["torque_limit"].as<std::vector<float>>();
+        if(protect["upper_joint_vel_limit"]) protect_upper_dq_limit_ = protect["upper_joint_vel_limit"].as<float>();
+        if(protect["clamp_ratio"]) protect_clamp_ratio_ = protect["clamp_ratio"].as<float>();
+        if(protect["warn_ratio"]) protect_warn_ratio_ = protect["warn_ratio"].as<float>();
+
+        if(!protect_tau_limit_.empty() || protect_upper_dq_limit_ > 0.0f)
+        {
+            this->registered_checks.emplace_back(
+                std::make_pair(
+                    [this]()->bool{ return this->motor_limits_exceeded(); },
+                    FSMStringMap.right.at("Passive")
+                )
+            );
+            spdlog::info("Motor protection: kill on {} joint torque limits, upper-body |dq| limit {:.1f} rad/s, "
+                         "command clamp at {:.0f}% of limit",
+                         protect_tau_limit_.size(), protect_upper_dq_limit_, 100.0f * protect_clamp_ratio_);
+        }
+    }
+    else
+    {
+        spdlog::info("Motor protection: disabled (no 'protect' block in config)");
+    }
+}
+
+void State_RLBase::apply_torque_clamp()
+{
+    if(protect_tau_limit_.empty() || protect_clamp_ratio_ <= 0.0f) return;
+
+    const auto & kp_cfg = env->robot->data.joint_stiffness;  // SDK order, from deploy.yaml
+    const auto & kd_cfg = env->robot->data.joint_damping;
+
+    std::lock_guard<std::mutex> lock(lowstate->mutex_);
+    const auto & ms = lowstate->msg_.motor_state();
+
+    for(size_t i(0); i < protect_tau_limit_.size() && i < ms.size() && i < kp_cfg.size(); ++i)
+    {
+        const float lim = protect_tau_limit_[i] * protect_clamp_ratio_;
+        if(lim <= 0.0f) continue;
+
+        auto & cmd = lowcmd->msg_.motor_cmd()[i];
+
+        // Same estimate the sim2real command writer makes: PD torque from the latest state.
+        // cmd.q() is the policy target, rewritten every tick by run() before this call, so a
+        // previous tick's clamp (which zeroes it) cannot leak into this one.
+        const float tau = kp_cfg[i] * (cmd.q() - ms[i].q()) + kd_cfg[i] * (0.0f - ms[i].dq());
+
+        if(std::fabs(tau) > lim)
+        {
+            cmd.tau() = std::clamp(tau, -lim, lim);
+            cmd.q()   = 0.0f;
+            cmd.dq()  = 0.0f;
+            cmd.kp()  = 1e-5f;
+            cmd.kd()  = 1e-5f;
+        }
+        else  // restore the PD command a previous tick may have overwritten
+        {
+            cmd.tau() = 0.0f;
+            cmd.dq()  = 0.0f;
+            cmd.kp()  = kp_cfg[i];
+            cmd.kd()  = kd_cfg[i];
+        }
+    }
+}
+
+bool State_RLBase::motor_limits_exceeded()
+{
+    if(protect_tau_limit_.empty() && protect_upper_dq_limit_ <= 0.0f) return false;
+
+    std::lock_guard<std::mutex> lock(lowstate->mutex_);
+    const auto & ms = lowstate->msg_.motor_state();
+
+    for(size_t i(0); i < protect_tau_limit_.size() && i < ms.size(); ++i)
+    {
+        const float lim = protect_tau_limit_[i];
+        if(lim <= 0.0f) continue;
+
+        const float tau = std::fabs(ms[i].tau_est());
+        if(tau > lim)
+        {
+            spdlog::critical("[protect] torque: sdk{} |tau_est| {:.1f} > {:.1f} Nm -> Passive", i, tau, lim);
+            return true;
+        }
+        // MuJoCo reports the post-saturation actuator force, so |tau_est| can sit exactly at the
+        // limit without ever exceeding it. Track how close it gets so a no-kill run is still readable.
+        if(tau / lim > protect_peak_ratio_) { protect_peak_ratio_ = tau / lim; protect_peak_idx_ = int(i); }
+    }
+
+    if(protect_upper_dq_limit_ > 0.0f)
+    {
+        for(size_t i(12); i < ms.size(); ++i)  // upper body: waist + arms
+        {
+            const float dq = std::fabs(ms[i].dq());
+            if(dq > protect_upper_dq_limit_)
+            {
+                spdlog::critical("[protect] upper-body velocity: sdk{} |dq| {:.1f} > {:.1f} rad/s -> Passive",
+                                 i, dq, protect_upper_dq_limit_);
+                return true;
+            }
+        }
+    }
+
+    if(protect_warn_ratio_ > 0.0f && ++protect_tick_ % 500 == 0)  // FSM runs at 1 kHz
+    {
+        if(protect_peak_idx_ >= 0 && protect_peak_ratio_ >= protect_warn_ratio_)
+        {
+            spdlog::warn("[protect] peak torque sdk{} at {:.0f}% of {:.0f} Nm over the last 0.5 s",
+                         protect_peak_idx_, 100.0f * protect_peak_ratio_, protect_tau_limit_[protect_peak_idx_]);
+        }
+        protect_peak_ratio_ = 0.0f;
+        protect_peak_idx_ = -1;
+    }
+
+    return false;
 }
 
 void State_RLBase::log_velocity()
@@ -142,10 +259,53 @@ void State_RLBase::log_velocity()
     );
 }
 
+void State_RLBase::open_logger()
+{
+    const int n = env->robot->data.joint_ids_map.size();
+    std::vector<std::string> columns{"t"};
+    for(int i(0); i < n; i++) columns.push_back(fmt::format("qdes_{:02d}", i));
+    for(int i(0); i < n; i++) columns.push_back(fmt::format("q_{:02d}", i));
+    for(int i(0); i < n; i++) columns.push_back(fmt::format("dq_{:02d}", i));
+    for(int i(0); i < n; i++) columns.push_back(fmt::format("tau_{:02d}", i));
+    logger.open(columns);
+
+    if(logger.enabled())
+    {
+        std::string mapping;
+        for(int i(0); i < n; i++) {
+            mapping += fmt::format("{}->sdk{} ", i, int(env->robot->data.joint_ids_map[i]));
+        }
+        spdlog::info("TelemetryLogger: policy joint order -> sdk index: {}", mapping);
+    }
+}
+
 void State_RLBase::run()
 {
     auto action = env->action_manager->processed_actions();
-    for(int i(0); i < env->robot->data.joint_ids_map.size(); i++) {
+    const int n = env->robot->data.joint_ids_map.size();
+    for(int i(0); i < n; i++) {
         lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];
+    }
+
+    apply_torque_clamp();  // must run after the targets are written, before post_run() publishes
+
+    if(logger.enabled())
+    {
+        std::vector<float> row;
+        row.reserve(4 * n);
+        for(int i(0); i < n; i++) row.push_back(action[i]);
+        {
+            std::lock_guard<std::mutex> lock(lowstate->mutex_);
+            for(int i(0); i < n; i++) {
+                row.push_back(lowstate->msg_.motor_state()[env->robot->data.joint_ids_map[i]].q());
+            }
+            for(int i(0); i < n; i++) {
+                row.push_back(lowstate->msg_.motor_state()[env->robot->data.joint_ids_map[i]].dq());
+            }
+            for(int i(0); i < n; i++) {
+                row.push_back(lowstate->msg_.motor_state()[env->robot->data.joint_ids_map[i]].tau_est());
+            }
+        }
+        logger.append(row);
     }
 }

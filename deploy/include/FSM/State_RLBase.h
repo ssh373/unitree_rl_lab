@@ -6,9 +6,11 @@
 #include "FSMState.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 #include "isaaclab/envs/mdp/terminations.h"
+#include "TelemetryLogger.h"
 #include <unitree/dds_wrapper/robots/go2/go2_sub.h>
 #include <algorithm>
 #include <cmath>
+#include <vector>
 #include <thread>
 
 class State_RLBase : public FSMState
@@ -18,6 +20,8 @@ public:
     
     void enter()
     {
+        open_logger();
+
         // set gain
         for (int i = 0; i < env->robot->data.joint_stiffness.size(); ++i)
         {
@@ -66,10 +70,35 @@ public:
         if (policy_thread.joinable()) {
             policy_thread.join();
         }
+        logger.close();
     }
 
 private:
     void log_velocity();
+    void open_logger();
+
+    // Replica of the sim2real CheckSafetyLimits kill (g1_sim2real/wholebody_rl.hpp), so the
+    // simulated robot collapses into Passive exactly where the real one would. Thresholds come
+    // from config.yaml (FSM.<state>.protect); omit that block to disable the whole check.
+    bool motor_limits_exceeded();
+
+    // Replica of the sim2real LowCommandWriter torque clamp: cap the commanded PD torque at
+    // clamp_ratio x torque_limit by handing that joint a pure torque command for the tick.
+    // Without it MuJoCo saturates at <motor ctrlrange> instead, i.e. at the kill threshold.
+    void apply_torque_clamp();
+
+    std::vector<float> protect_tau_limit_;   // per motor, SDK order [Nm]; empty = off
+    float protect_upper_dq_limit_ = 0.0f;    // upper body only (sdk >= 12) [rad/s]; 0 = off
+    float protect_clamp_ratio_ = 0.0f;       // clamp commands at this fraction of the limit; 0 = off
+    float protect_warn_ratio_ = 0.0f;        // periodically report peak |tau_est| / limit; 0 = off
+    float protect_peak_ratio_ = 0.0f;
+    int protect_peak_idx_ = -1;
+    long protect_tick_ = 0;
+
+protected:
+    TelemetryLogger logger;
+
+private:
 
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> env;
     std::shared_ptr<unitree::robot::go2::subscription::SportModeState> highstate;

@@ -177,7 +177,12 @@ def main():
     print(f"[INFO] wrote {args.out}")
 
     # A table view so the figure is never the only way to read the numbers.
-    columns = ["cmd_mps", "speed_mps", "cot", "power_w", "torque_sq", "track_err", "survival"]
+    columns = [
+        "cmd_mps", "speed_mps", "cot", "power_w", "torque_sq", "track_err", "track_err_yaw",
+        "contact_ratio", "flight_ratio", "phase_match", "survival",
+    ]
+    # Older CSVs predate the gait columns; keep them readable instead of crashing.
+    columns = [c for c in columns if all(c in row for _, rows in series for row in rows)]
     for label, rows in series:
         print(f"\n--- {label}")
         print("  ".join(f"{c:>10s}" for c in columns))

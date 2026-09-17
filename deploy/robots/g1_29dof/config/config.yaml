@@ -51,13 +51,17 @@ FSM:
       10,10,10,10,10,10,10,
     ]
     ts: [0, 3]
+    # Stand pose, SDK motor order. The elbows are held at 0 (not 0.97) to match the running
+    # policy's default_joint_pos: entering the policy from a 0.97 rad elbow commands a ~39 Nm
+    # step on a light forearm, which flings it past the upper-body velocity limit and trips the
+    # protection immediately. Keep this in sync with the policy's default pose.
     qs: [
       [],
       [ -0.1, 0,0,0.3,-0.2,0,
         -0.1, 0,0,0.3,-0.2,0,
         0,0,0,
-        0, 0.25,0,0.97,0.15, 0,0,
-        0, -0.25,0,0.97,-0.15, 0,0
+        0, 0.25,0,0.,0.15, 0,0,
+        0, -0.25,0,0.,-0.15, 0,0
       ]
     ]
   Velocity:
@@ -68,6 +72,39 @@ FSM:
 
     policy_dir: /home/kist/unitree_rl_lab/logs/rsl_rl/unitree_g1_29dof_running/2026-09-11_18-14-36
     # policy_dir: ../../../logs/rsl_rl/unitree_g1_29dof_velocity
+
+    # Replica of the sim2real CheckSafetyLimits kill, so the simulated robot drops into Passive
+    # exactly where the real one would. Delete this block to run without motor protection.
+    #
+    # torque_limit is in SDK motor order. The values below are the G1 motor peak specs, which are
+    # also the training effort_limit_sim and the MuJoCo <motor ctrlrange>. NOTE: MuJoCo reports the
+    # post-saturation actuator force as tau_est, so at these values |tau_est| tops out AT the limit
+    # and the kill never fires -- watch the "[protect] peak torque" warnings instead. Swap the legs
+    # to 80/120 (the sim2real defaults) to see the kill actually trigger.
+    protect:
+      # Mirrors the sim2real kill threshold (wholebody_rl.hpp torque_limit) = G1 motor peak specs
+      # = training effort_limit_sim = MJCF <motor ctrlrange>.
+      # Caveat: MuJoCo reports the post-saturation actuator force as tau_est, so |tau_est| tops out
+      # AT this value and the kill cannot fire here. Read the "[protect] peak torque" warnings
+      # instead -- with warn_ratio 0.97 a warning means the real robot would be clamping too.
+      torque_limit: [ 88, 139,  88, 139,  50,  50,
+                      88, 139,  88, 139,  50,  50,
+                      88,  50,  50,
+                      25,  25,  25,  25,  25,   5,   5,
+                      25,  25,  25,  25,  25,   5,   5 ]
+      # Alternative: the old sim2real values, for reproducing when/where the previous 120 Nm kill
+      # would have ended a run.
+      # torque_limit: [ 80, 120,  80, 120,  50,  50,
+      #                 80, 120,  80, 120,  50,  50,
+      #                 80,  50,  50,
+      #                 25,  25,  25,  25,  25,   5,   5,
+      #                 25,  25,  25,  25,  25,   5,   5 ]
+      upper_joint_vel_limit: 15.0   # upper body only (sdk >= 12), matches sim2real joint_vel_limit
+      clamp_ratio: 0.97             # = sim2real TORQUE_CLAMP_RATIO: commands capped at 0.97 x limit
+                                    # (knee 135 Nm). Without this the only cap is MuJoCo's
+                                    # <motor ctrlrange>, i.e. the kill threshold itself.
+      warn_ratio: 0.97              # = sim2real TORQUE_CLAMP_RATIO: 0.97 x 139 = 135 Nm, the point
+                                    # where the real controller starts clamping the command
   Mimic_Dance_102:
     transitions: 
       Passive: LT + B.on_pressed

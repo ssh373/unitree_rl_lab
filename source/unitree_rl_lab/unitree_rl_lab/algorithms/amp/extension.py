@@ -5,6 +5,12 @@ Per environment step the discriminator scores the ``amp`` observation group -- t
 added to the task reward. After every PPO update the discriminator is trained on transitions from
 the rollout that was just collected against transitions from the reference motions.
 
+Reference transitions for discriminator training are drawn **speed-matched** to the policy
+transitions they are compared with (:meth:`AmpMotionData.sample_matched`). The running takes are
+mostly 1-2 m/s while the task commands down to 0.1 m/s; sampled uniformly, the discriminator learns
+"fast means human" from ``base_lin_vel`` alone and the style reward turns into a speed bonus that
+fights command tracking. Matched by speed, it has to score how the body moves at a given speed.
+
 Two masks keep the style reward honest:
 
 * **Reset steps.** When an environment resets, its observation history is refilled with the reset
@@ -31,7 +37,7 @@ from typing import Any
 import torch
 from tensordict import TensorDict
 
-from unitree_rl_lab.algorithms.amp.data import AmpMotionData
+from unitree_rl_lab.algorithms.amp.data import AmpMotionData, transition_speed
 from unitree_rl_lab.algorithms.amp.discriminator import AmpDiscriminator
 from unitree_rl_lab.algorithms.extensions import PPOExtension
 
@@ -45,8 +51,10 @@ class AMPExtension(PPOExtension):
         *,
         obs_group: str = "amp",
         speed_range: tuple[float, float] = (0.2, 2.5),
-        reward_weight: float = 0.5,
-        reward_weight_start: float | None = None,
+        speed_matched_sampling: bool = True,
+        speed_match_window: float = 0.1,
+        reward_weight: float = 0.2,
+        reward_weight_start: float = 0.0,
         ramp_start_iter: int = 0,
         ramp_end_iter: int = 0,
         command_name: str | None = "base_velocity",
@@ -67,8 +75,12 @@ class AMPExtension(PPOExtension):
             motion_files: Reference motion npz files (see :mod:`unitree_rl_lab.algorithms.amp.data`).
             obs_group: Name of the observation group holding the transition pair.
             speed_range: Planar-speed gate applied to the reference transitions.
+            speed_matched_sampling: Draw each reference transition for discriminator training at the
+                speed of the policy transition it is paired with (see
+                :meth:`AmpMotionData.sample_matched`), so speed itself is not a discriminative cue.
+            speed_match_window: Half-width in m/s of the speed window used for matching.
             reward_weight: Final weight of the style reward relative to the task reward.
-            reward_weight_start: Weight at ``ramp_start_iter``; defaults to ``reward_weight`` (no ramp).
+            reward_weight_start: Weight at ``ramp_start_iter``; ignored when the ramp is disabled.
             ramp_start_iter / ramp_end_iter: PPO iterations over which the weight ramps linearly.
             command_name / command_gate: Zero the style reward when the planar speed command is below
                 ``command_gate``. ``command_name=None`` disables the gate.
@@ -81,8 +93,10 @@ class AMPExtension(PPOExtension):
                 manager can be read. Not part of the user-facing configuration.
         """
         self.obs_group = obs_group
+        self.speed_matched_sampling = speed_matched_sampling
+        self.speed_match_window = speed_match_window
         self.reward_weight_end = reward_weight
-        self.reward_weight_start = reward_weight if reward_weight_start is None else reward_weight_start
+        self.reward_weight_start = reward_weight_start
         self.ramp_start_iter = ramp_start_iter
         self.ramp_end_iter = ramp_end_iter
         self.command_name = command_name
@@ -116,7 +130,13 @@ class AMPExtension(PPOExtension):
     def _lazy_prepare(self, amp_obs: torch.Tensor) -> None:
         if self.discriminator is not None:
             return
-        num_features = amp_obs.shape[-1]
+        # The first environment step happens inside the runner's ``torch.inference_mode()`` rollout
+        # block. Anything created there would be an inference tensor, and the discriminator's
+        # parameters and normalisation buffers are updated in place later, outside that block.
+        with torch.inference_mode(False):
+            self._build(amp_obs.shape[-1])
+
+    def _build(self, num_features: int) -> None:
         self.discriminator = AmpDiscriminator(num_features, device=self.device, **self._disc_kwargs)
         self.optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.learning_rate)
         if self._pending_state is not None:
@@ -194,7 +214,17 @@ class AMPExtension(PPOExtension):
         for _ in range(self.num_updates_per_iter):
             idx = torch.randint(0, policy_all.shape[0], (self.batch_size,), device=policy_all.device)
             policy_batch = policy_all[idx]
-            reference_batch = self.data.sample(self.batch_size).to(policy_batch.device)
+            policy_speed = transition_speed(policy_batch)
+            if self.speed_matched_sampling:
+                reference_batch = self.data.sample_matched(policy_speed, self.speed_match_window)
+            else:
+                reference_batch = self.data.sample(self.batch_size)
+            reference_batch = reference_batch.to(policy_batch.device)
+            # How well the two sides agree on speed: with matching this should sit near zero except
+            # where the clips have no data at the policy's speed.
+            speed_err = (policy_speed - transition_speed(reference_batch)).abs().mean().item()
+            logs.setdefault("amp/speed_match_err", []).append(speed_err)
+            logs.setdefault("amp/policy_speed_mean", []).append(policy_speed.mean().item())
             policy_batch, reference_batch = self._augment(policy_batch, reference_batch)
 
             self.discriminator.update_normalization(policy_batch, reference_batch)

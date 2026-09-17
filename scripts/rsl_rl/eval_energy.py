@@ -18,7 +18,15 @@ Reported per speed:
     leg/arm/waist  split of power_w by joint group
     speed_mps      achieved planar speed
     track_err      |commanded - achieved| planar velocity
+    track_err_yaw  |commanded - achieved| yaw rate
+    ang_vel_xy_rms RMS roll/pitch rate of the trunk (trunk wobble)
+    contact_ratio  mean fraction of feet in contact; ~stance ratio for a run, >=0.5 for a walk
+    flight_ratio   fraction of steps with no foot in contact (a walk has none)
+    phase_match    agreement with the commanded alternating-contact pattern
     survival       fraction of envs that never terminated during the window
+
+The gait columns are what distinguishes a policy that got cheaper from one that quietly
+stopped running: dropping the flight phase is the easiest way to lower mechanical cost.
 
 Example:
     python scripts/rsl_rl/eval_energy.py --task Unitree-G1-29dof-Running --headless \
@@ -151,6 +159,15 @@ def main():
     effort_limit = robot.data.joint_effort_limits.clamp_min(1e-6)
     group_ids = {name: robot.find_joints(expr)[0] for name, expr in JOINT_GROUPS.items()}
 
+    # Gait pattern comes from the same command config that defines the training metric,
+    # so eval and the wandb gait/ curves agree on what "running" means.
+    cmd_cfg = env_cfg.commands.base_velocity
+    contact_sensor = base_env.scene.sensors[cmd_cfg.contact_sensor_name]
+    feet_ids, _ = contact_sensor.find_bodies(cmd_cfg.feet_body_names, preserve_order=True)
+    gait_offsets = torch.tensor(cmd_cfg.gait_offsets, device=device)
+    gait_period = cmd_cfg.gait_period
+    gait_stance_ratio = cmd_cfg.gait_stance_ratio
+
     window = args_cli.warmup_steps + args_cli.measure_steps
     max_steps = int(base_env.max_episode_length)
     if window > max_steps:
@@ -172,6 +189,11 @@ def main():
         torque_sq = torch.zeros(num_envs, device=device)
         speed_sum = torch.zeros(num_envs, device=device)
         track_err_sum = torch.zeros(num_envs, device=device)
+        track_err_yaw_sum = torch.zeros(num_envs, device=device)
+        ang_vel_xy_sq_sum = torch.zeros(num_envs, device=device)
+        contact_sum = torch.zeros(num_envs, device=device)
+        flight_sum = torch.zeros(num_envs, device=device)
+        phase_match_sum = torch.zeros(num_envs, device=device)
         group_energy = {name: torch.zeros(num_envs, device=device) for name in group_ids}
         valid = torch.ones(num_envs, dtype=torch.bool, device=device)
 
@@ -197,13 +219,26 @@ def main():
                 power = joint_power.sum(dim=-1)
                 planar_vel = robot.data.root_lin_vel_w[:, :2]
                 planar_speed = torch.linalg.norm(planar_vel, dim=-1)
-                command_xy = base_env.command_manager.get_command("base_velocity")[:, :2]
+                command = base_env.command_manager.get_command("base_velocity")
+                command_xy = command[:, :2]
+                ang_vel_b = robot.data.root_ang_vel_b
+
+                # Every env reset together at step 0, so the global phase is shared; envs that
+                # fell and auto-reset mid-window are already excluded through `valid`.
+                is_contact = contact_sensor.data.current_contact_time[:, feet_ids] > 0.0
+                global_phase = (base_env.episode_length_buf * dt) % gait_period / gait_period
+                expected_contact = (global_phase.unsqueeze(1) + gait_offsets).remainder(1.0) < gait_stance_ratio
 
                 energy_j += power * dt
                 distance_m += planar_speed * dt
                 torque_sq += torch.square(torque / effort_limit).sum(dim=-1)
                 speed_sum += planar_speed
                 track_err_sum += torch.linalg.norm(command_xy - robot.data.root_lin_vel_b[:, :2], dim=-1)
+                track_err_yaw_sum += torch.abs(command[:, 2] - ang_vel_b[:, 2])
+                ang_vel_xy_sq_sum += torch.square(ang_vel_b[:, :2]).sum(dim=-1)
+                contact_sum += is_contact.float().mean(dim=1)
+                flight_sum += (~is_contact).all(dim=1).float()
+                phase_match_sum += (expected_contact == is_contact).float().mean(dim=1)
                 for name, ids in group_ids.items():
                     group_energy[name] += joint_power[:, ids].sum(dim=-1) * dt
 
@@ -226,6 +261,11 @@ def main():
             "arm_w": m(group_energy["arm"]) / (n * dt),
             "waist_w": m(group_energy["waist"]) / (n * dt),
             "track_err": m(track_err_sum) / n,
+            "track_err_yaw": m(track_err_yaw_sum) / n,
+            "ang_vel_xy_rms": (m(ang_vel_xy_sq_sum) / n) ** 0.5,
+            "contact_ratio": m(contact_sum) / n,
+            "flight_ratio": m(flight_sum) / n,
+            "phase_match": m(phase_match_sum) / n,
             "survival": survival,
         }
         rows.append(row)
@@ -233,7 +273,9 @@ def main():
             f"cmd {row['cmd_mps']:4.2f} | act {row['speed_mps']:5.2f} m/s | "
             f"P {row['power_w']:7.1f} W | CoT {row['cot']:5.3f} | tau^2 {row['torque_sq']:5.2f} | "
             f"leg {row['leg_w']:6.1f} arm {row['arm_w']:5.1f} waist {row['waist_w']:5.1f} W | "
-            f"err {row['track_err']:4.2f} | alive {row['survival']:.2f}"
+            f"err {row['track_err']:4.2f} yaw {row['track_err_yaw']:4.2f} | "
+            f"contact {row['contact_ratio']:.2f} flight {row['flight_ratio']:.2f} "
+            f"phase {row['phase_match']:.2f} | alive {row['survival']:.2f}"
         )
 
     if rows:
