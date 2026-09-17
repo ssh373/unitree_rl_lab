@@ -162,3 +162,61 @@ class TorqueOnlyEnvCfg(BaseRobotEnvCfg):
 class TorqueOnlyPlayEnvCfg(BaseRobotPlayEnvCfg):
     rewards: TorqueOnlyRewardsCfg = TorqueOnlyRewardsCfg()
     curriculum: TorqueOnlyCurriculumCfg = TorqueOnlyCurriculumCfg()
+
+
+"""
+CoT variant: the combined penalties plus a speed-normalized power cost.
+
+The two terms above penalize power regardless of how fast the robot was asked to go, so the
+slowest -- and least efficient -- commands get the least pressure. ``joint_cot`` adds the
+adaptive energy regularization of Liang et al. (2024), a per-step cost of transport, on top of
+them. It is a separate task so the ablation configurations stay untouched.
+
+Constant weights and no ramp. With the current environment the running gait emerges after
+the old ramp had already finished, so the ramp never did what it was designed for; if this
+variant fails to stand within ~8k iterations, a gate on episode length is the fix, not a
+linear schedule.
+
+Weight: at 2 m/s the baseline's 446 W gives an exponent of 446/(2800*1.98) = 0.080 and a cost
+of 0.077, so -1.5 adds -0.12 to the existing -0.37 of energy pressure (13% of the ~3.6 of
+positive reward, up from 10%). At 0.5 m/s the same weight roughly doubles the pressure, which
+is the point. -3.0 would reproduce the power term's 2 m/s pressure on its own, i.e. the value
+to use with ENERGY_POWER_WEIGHT set to 0 for a clean replace-instead-of-add comparison.
+"""
+
+ENERGY_COT_SIGMA_LIN = 2800.0  # N; 8.5 x G1 weight, matches the paper's regime
+ENERGY_COT_SIGMA_ANG = 1400.0  # N*m/rad; paper ratio sigma_ang = 0.5 * sigma_lin
+ENERGY_COT_V_FLOOR = 0.3  # m/s; same floor as the training metric's cot_min_speed
+ENERGY_COT_WEIGHT = -1.5
+
+
+@configclass
+class CotRewardsCfg(BaseRewardsCfg):
+    """Power + torque at their final weights, plus the speed-normalized power cost."""
+
+    joint_power = RewTerm(
+        func=mdp.joint_power_l1,
+        weight=ENERGY_POWER_WEIGHT,
+        params={"power_ref": ENERGY_POWER_REF_W},
+    )
+    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=ENERGY_TORQUE_WEIGHT)
+    joint_cot = RewTerm(
+        func=mdp.joint_power_cot_exp,
+        weight=ENERGY_COT_WEIGHT,
+        params={
+            "sigma_lin": ENERGY_COT_SIGMA_LIN,
+            "sigma_ang": ENERGY_COT_SIGMA_ANG,
+            "v_floor": ENERGY_COT_V_FLOOR,
+        },
+    )
+
+
+@configclass
+class CotEnvCfg(BaseRobotEnvCfg):
+    # Curriculum is inherited from the baseline: terrain and command levels only, no ramp.
+    rewards: CotRewardsCfg = CotRewardsCfg()
+
+
+@configclass
+class CotPlayEnvCfg(BaseRobotPlayEnvCfg):
+    rewards: CotRewardsCfg = CotRewardsCfg()

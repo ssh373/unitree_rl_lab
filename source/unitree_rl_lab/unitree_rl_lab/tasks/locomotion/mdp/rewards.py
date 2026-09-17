@@ -64,6 +64,50 @@ def joint_torque_normalized_l2(
     return torch.sum(torch.square(torque / limit), dim=-1)
 
 
+def joint_power_cot_exp(
+    env: ManagerBasedRLEnv,
+    sigma_lin: float = 2800.0,
+    sigma_ang: float = 1400.0,
+    v_floor: float = 0.3,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Mechanical power over a generalized speed, squashed to [0, 1): a per-step cost of transport.
+
+    Adaptive energy regularization after Liang et al. (arXiv:2403.20001). Dividing power by
+    speed gives every commanded speed the same pressure, where a flat power penalty barely
+    touches the slow gaits that are the least efficient (baseline CoT is 1.06 at 0.5 m/s
+    against 0.67 at 1.5 m/s, yet the power term there is a third of its 2.5 m/s value).
+
+    ``sigma_lin`` has units of force. The paper's 1000 N is 8.5x the Go1's weight, which
+    keeps the exponent near 0.1 where exp is close to linear -- the exponential only guards
+    against the v -> 0 blow-up, it does not reshape the cost. 8.5 x G1 weight (327 N) = 2800.
+
+    Two changes from the paper. The speed is the smaller of measured and commanded, so
+    under-tracking still costs energy but outrunning the command does not pay. And the term
+    is a cost rather than the paper's bonus: in a weighted sum the bonus's constant offset
+    would act as a large survival reward.
+
+    Note this is the instantaneous, time-weighted form, not the distance-weighted ratio of
+    integrals that eval_energy.py reports; the two differ whenever speed varies.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    qvel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    qfrc = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    power = torch.sum(torch.abs(qvel * qfrc), dim=-1)
+
+    command = env.command_manager.get_command(command_name)
+    lin_speed = torch.minimum(
+        torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=-1),
+        torch.linalg.norm(command[:, :2], dim=-1),
+    )
+    ang_speed = torch.minimum(torch.abs(asset.data.root_ang_vel_b[:, 2]), torch.abs(command[:, 2]))
+    speed_scale = sigma_lin * lin_speed + sigma_ang * ang_speed
+    # The floor keeps a standing command from turning into the maximum penalty.
+    return 1.0 - torch.exp(-power / speed_scale.clamp_min(sigma_lin * v_floor))
+
+
 def stand_still(
     env: ManagerBasedRLEnv, command_name: str = "base_velocity", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
