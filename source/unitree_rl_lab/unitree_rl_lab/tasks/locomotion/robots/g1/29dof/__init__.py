@@ -34,19 +34,6 @@ gym.register(
     },
 )
 
-# Single-term ablations of the above: mechanical work only, and resistive heating only.
-for _suffix, _cfg in (("Power", "PowerOnly"), ("Torque", "TorqueOnly")):
-    gym.register(
-        id=f"Unitree-G1-29dof-Running-{_suffix}",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:{_cfg}EnvCfg",
-            "play_env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:{_cfg}PlayEnvCfg",
-            "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningPPORunnerCfg",
-        },
-    )
-
 # Combined penalties plus a speed-normalized power cost (per-step CoT, Liang et al. 2024).
 # Constant weights, no ramp; see running_reward_env_cfg.py for the weight arithmetic.
 gym.register(
@@ -56,6 +43,18 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:CotEnvCfg",
         "play_env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:CotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningPPORunnerCfg",
+    },
+)
+
+# Single physics-grounded power term after PACE (arXiv:2509.06342); see running_reward_env_cfg.py.
+gym.register(
+    id="Unitree-G1-29dof-Running-PACE",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:PaceEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.running_reward_env_cfg:PacePlayEnvCfg",
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningPPORunnerCfg",
     },
 )

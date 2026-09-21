@@ -389,7 +389,7 @@ docker run --rm --gpus all -e OMNI_KIT_ALLOW_ROOT=1 \
 docker compose -f docker/docker-compose.yaml run --rm \
   -v $HOME/.netrc:/root/.netrc:ro \
   unitree-rl-lab ./unitree_rl_lab.sh -t \
-  --task Unitree-G1-29dof-Running-Torque --max_iterations 30000 \
+  --task Unitree-G1-29dof-Running-Reward --max_iterations 30000 \
   --logger wandb --log_project_name isaaclab \
   --video --video_interval 4800 --video_length 500
 ```

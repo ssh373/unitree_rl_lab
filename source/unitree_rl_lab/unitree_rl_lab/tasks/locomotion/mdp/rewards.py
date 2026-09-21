@@ -33,18 +33,22 @@ def joint_power_l1(
     power_ref: float = 500.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Mechanical joint power ``sum |tau * qdot|`` normalized by a reference power.
+    """Positive mechanical joint power ``sum max(tau * qdot, 0)`` normalized by a reference power.
 
-    Same quantity as :func:`energy`, but divided by ``power_ref`` (in Watt) so the term
-    stays O(1) and its weight is directly comparable with the tracking rewards. Calibrate
-    ``power_ref`` from the ``Metrics/base_velocity/energy/mech_power_w`` diagnostic logged
-    by the velocity command term.
+    Only positive (motoring) work is charged, per motor. Negative work -- the motor braking
+    while the joint is driven by gravity or inertia -- is assumed to be dissipated, not
+    recovered, so it costs nothing here: the G1 has no regenerative path to the battery, and
+    charging |tau * qdot| would penalize the eccentric phases of a gait as if they drew power.
+    Divided by ``power_ref`` (in Watt) so the term stays O(1) and its weight is directly
+    comparable with the tracking rewards. Note that the ``energy/mech_power_w`` diagnostic
+    logged by the velocity command term is the gross ``sum |tau * qdot|``, so it is an upper
+    bound of this quantity, not the same number.
     """
     asset: Articulation = env.scene[asset_cfg.name]
 
     qvel = asset.data.joint_vel[:, asset_cfg.joint_ids]
     qfrc = asset.data.applied_torque[:, asset_cfg.joint_ids]
-    return torch.sum(torch.abs(qvel * qfrc), dim=-1) / power_ref
+    return torch.sum(torch.clamp_min(qvel * qfrc, 0.0), dim=-1) / power_ref
 
 
 def joint_torque_normalized_l2(
@@ -95,7 +99,9 @@ def joint_power_cot_exp(
 
     qvel = asset.data.joint_vel[:, asset_cfg.joint_ids]
     qfrc = asset.data.applied_torque[:, asset_cfg.joint_ids]
-    power = torch.sum(torch.abs(qvel * qfrc), dim=-1)
+    # Positive (motoring) work per motor only; negative work is dissipated, not recovered.
+    # Same convention as :func:`joint_power_l1`.
+    power = torch.sum(torch.clamp_min(qvel * qfrc, 0.0), dim=-1)
 
     command = env.command_manager.get_command(command_name)
     lin_speed = torch.minimum(
@@ -106,6 +112,88 @@ def joint_power_cot_exp(
     speed_scale = sigma_lin * lin_speed + sigma_ang * ang_speed
     # The floor keeps a standing command from turning into the maximum penalty.
     return 1.0 - torch.exp(-power / speed_scale.clamp_min(sigma_lin * v_floor))
+
+
+def _joint_coefficients(asset: Articulation, mapping: dict[str, float], joint_ids) -> torch.Tensor:
+    """Expand a {joint-name-regex: value} mapping to a per-joint tensor in joint order."""
+    import re
+
+    names = [asset.joint_names[i] for i in (range(asset.num_joints) if joint_ids == slice(None) else joint_ids)]
+    out = torch.zeros(len(names), device=asset.device)
+    for j, name in enumerate(names):
+        for pattern, value in mapping.items():
+            if re.search(pattern, name):
+                out[j] = value
+                break
+        else:
+            raise KeyError(f"no coefficient matches joint '{name}'")
+    return out
+
+
+def pace_total_power(
+    env: ManagerBasedRLEnv,
+    k_el: dict[str, float],
+    k_regen: float = 0.0,
+    include_potential: bool = False,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Physics-grounded actuator power in Watt, after PACE (arXiv:2509.06342, eqs. 11-14).
+
+    ``P_total = P_el + P_mech (+ P_pot)`` with
+
+    * ``P_el   = sum_j tau_j^2 * k_el_j``           Joule heating, ``k_el = R / (r k_i)^2`` [W/Nm^2]
+    * ``P_mech = sum_j max(tau_j qdot_j, 0) + k_regen * sum_j min(tau_j qdot_j, 0)``
+      -- the sign test is done *per motor*: positive (motoring) work is charged in full and
+      negative (braking) work is assumed dissipated in the motor, so it costs nothing at the
+      default ``k_regen = 0``. This departs from the paper, which sums the joints before the sign
+      test so that braking in one joint offsets motoring in another over a shared DC bus; the G1
+      has no known regenerative path, so no offsetting is granted here (user decision 2026-09-21).
+    * ``P_pot  = sum_b m_b g v_bz``                 optional; integrates to ~0 over a gait cycle and
+      is already inside tau^T qdot, so it only reshapes vertical motion within the cycle.
+
+    Differences from :func:`joint_power_l1` / :func:`joint_torque_normalized_l2`: this is one
+    quantity in one unit, so a single weight covers heat and work; and heat is scaled by each
+    motor's own ``R/(r k_i)^2`` instead of
+    ``1/tau_limit^2``. ``k_el`` for the G1 is not published -- see the running_pace cfg for the
+    torque-speed-curve estimate and its caveat.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    tau = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    qdot = asset.data.joint_vel[:, asset_cfg.joint_ids]
+
+    if not hasattr(env, "_pace_k_el"):
+        env._pace_k_el = _joint_coefficients(asset, k_el, asset_cfg.joint_ids)
+    p_el = torch.sum(torch.square(tau) * env._pace_k_el, dim=-1)
+
+    # Per-motor sign test: motoring work in full, braking work only at the regeneration
+    # efficiency (0 = dissipated). Same convention as joint_power_l1 / joint_power_cot_exp.
+    p_joint = tau * qdot
+    p_mech = torch.sum(torch.clamp_min(p_joint, 0.0) + k_regen * torch.clamp_max(p_joint, 0.0), dim=-1)
+
+    total = p_el + p_mech
+    if include_potential:
+        total = total + torch.sum(asset.data.default_mass.to(env.device) * asset.data.body_lin_vel_w[:, :, 2], dim=-1) * 9.81
+    return total
+
+
+def pace_energy_cost(
+    env: ManagerBasedRLEnv,
+    k_el: dict[str, float],
+    k_regen: float = 0.0,
+    include_potential: bool = False,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """PACE energy reward, eq. 15-16: ``P_total / (|v_cmd|^2 + 1)`` in Watt.
+
+    The commanded speed sets the normalization, so the policy cannot lower the term by running
+    faster or slower than asked, and the ``+1`` keeps a standing command finite. Compared with
+    the CoT-style ``1/v`` this leans harder on high speed: at 2.5 m/s the factor is 0.14.
+    Weight it negative; the paper uses -16e-5 per Watt for ANYmal/Tytan.
+    """
+    command = env.command_manager.get_command(command_name)
+    gamma = 1.0 / (torch.sum(torch.square(command[:, :2]), dim=-1) + 1.0)
+    return gamma * pace_total_power(env, k_el, k_regen, include_potential, asset_cfg)
 
 
 def stand_still(
