@@ -16,9 +16,13 @@ Two masks keep the style reward honest:
 * **Reset steps.** When an environment resets, its observation history is refilled with the reset
   state, so the pair no longer describes a movement. Its style reward is zeroed and the pair is
   excluded from discriminator training.
-* **Command gate.** Environments that are commanded to stand still (``rel_standing_envs``) must not
-  be pushed to move by a reward that only knows running; below ``command_gate`` m/s the style
-  reward is zero, mirroring ``_command_run_gate`` in the task rewards.
+* **Command gate.** Below ``command_gate`` m/s of commanded planar speed the style reward is zero
+  *and* the transition is kept out of the discriminator's policy batch. Originally this only
+  excluded standing environments (0.1 m/s); it is now set to the reference speed floor, because
+  a policy transition slower than any reference transition would let the discriminator separate
+  the two sides by speed again -- the very cue speed matching removes. Slow commands are therefore
+  learned from the task rewards alone. The gate is on the *command*, not the achieved speed, so the
+  policy cannot earn style reward by running faster than asked.
 
 When the PPO symmetry augmentation is on, reference batches are mirrored with the same function
 that mirrors the policy batches. Otherwise the discriminator would see mirrored transitions only
@@ -124,6 +128,11 @@ class AMPExtension(PPOExtension):
         self.iteration = 0
         self._style_reward_sum = torch.zeros((), device=device)
         self._style_reward_count = 0
+        # Command-gate mask of every environment step of the current rollout, in call order, and the
+        # mask of the last step of the previous rollout (which produced this rollout's first observation).
+        self._gate_masks: list[torch.Tensor] = []
+        self._last_gate_mask: torch.Tensor | None = None
+        self._gate_warned = False
 
     # -- setup --------------------------------------------------------------------------------
 
@@ -181,8 +190,11 @@ class AMPExtension(PPOExtension):
             style = style * (1.0 - dones.float().to(style.device).view(-1))
             if self.command_name is not None and self._env is not None:
                 cmd = self._env.unwrapped.command_manager.get_command(self.command_name)
-                moving = torch.linalg.vector_norm(cmd[:, :2], dim=-1) >= self.command_gate
-                style = style * moving.float().to(style.device)
+                gated = torch.linalg.vector_norm(cmd[:, :2], dim=-1) >= self.command_gate
+                style = style * gated.float().to(style.device)
+            else:
+                gated = torch.ones(style.shape[0], dtype=torch.bool, device=style.device)
+        self._gate_masks.append(gated.to(style.device))
         self._style_reward_sum += style.sum()
         self._style_reward_count += style.numel()
         return rewards + self.reward_weight * style.to(rewards.device).view_as(rewards)
@@ -190,11 +202,36 @@ class AMPExtension(PPOExtension):
     # -- discriminator training ----------------------------------------------------------------
 
     def _rollout_transitions(self, storage) -> torch.Tensor:
-        """All valid ``amp`` pairs from the rollout: drop the observation right after a reset."""
+        """Valid ``amp`` pairs from the rollout: not right after a reset, and command-gated.
+
+        ``storage.observations[i]`` is the observation the policy acted on at step ``i``, i.e. the
+        one produced by environment step ``i - 1``. The reset flag and the command gate recorded at
+        that earlier step are therefore what decide whether pair ``i`` is usable; pair 0 is decided
+        by the last step of the previous rollout.
+        """
         obs = storage.observations[self.obs_group]  # (steps, envs, F)
         dones = storage.dones.squeeze(-1).bool()  # (steps, envs)
         valid = torch.ones_like(dones)
         valid[1:] &= ~dones[:-1]
+
+        masks, self._gate_masks = self._gate_masks, []
+        if len(masks) == obs.shape[0]:
+            # No previous rollout means obs[0] is the initial reset observation, not a movement.
+            prev = self._last_gate_mask if self._last_gate_mask is not None else torch.zeros_like(masks[0])
+            gate = torch.stack([prev] + masks[:-1]).to(valid.device)
+            valid &= gate
+            self._last_gate_mask = masks[-1]
+        elif not self._gate_warned:
+            import warnings
+
+            warnings.warn(
+                f"AMPExtension recorded {len(masks)} command-gate masks for a rollout of {obs.shape[0]} steps;"
+                " discriminator batches are not command-gated.",
+                RuntimeWarning,
+            )
+            self._gate_warned = True
+        if not valid.any():
+            return obs[:0]
         return obs[valid]
 
     def _augment(self, policy_batch: torch.Tensor, reference_batch: torch.Tensor):
@@ -211,6 +248,15 @@ class AMPExtension(PPOExtension):
             return {}
         policy_all = self._rollout_transitions(storage)
         logs: dict[str, list[float]] = {}
+        num_pairs = storage.observations[self.obs_group].shape[0] * storage.observations[self.obs_group].shape[1]
+        gated_fraction = policy_all.shape[0] / max(num_pairs, 1)
+        if policy_all.shape[0] == 0:
+            # Nothing commanded fast enough this rollout (early curriculum): the discriminator waits.
+            self.iteration += 1
+            self._style_reward_sum.zero_()
+            self._style_reward_count = 0
+            return {"amp/reward_weight": self.reward_weight, "amp/gated_fraction": 0.0, "amp/style_reward_mean": 0.0}
+        logs["amp/gated_fraction"] = [gated_fraction]
         for _ in range(self.num_updates_per_iter):
             idx = torch.randint(0, policy_all.shape[0], (self.batch_size,), device=policy_all.device)
             policy_batch = policy_all[idx]

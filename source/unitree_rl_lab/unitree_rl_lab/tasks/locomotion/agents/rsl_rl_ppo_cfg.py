@@ -80,8 +80,14 @@ class RslRlAmpCfg:
     motion_files: list[str] = MISSING
     """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
     obs_group: str = "amp"
-    speed_range: tuple[float, float] = (0.2, 2.5)
-    """Planar-speed gate on reference transitions: drop standing still and speeds the task never commands."""
+    speed_range: tuple[float, float] = (0.0, 2.5)
+    """Planar-speed gate on reference transitions. The upper bound is the command ceiling. The lower bound
+    admits everything down to standing: the study compares the arms at 2 m/s only, so a human-like *walk*
+    at slow commands is acceptable (decision 2026-09-21). Two earlier floors are documented in the project
+    notes: 0.2 taught walking at every speed and stalled the velocity curriculum at 0.9 m/s; 1.0 kept the
+    running gait but, once active, pulled ``track_lin_vel_xy`` under the curriculum's 0.8*weight threshold
+    and stalled it at 1.3 m/s. Neither reached 2 m/s -- pair any floor with a reward ramp that starts after
+    the curriculum has opened. Keep ``command_gate`` at or above this floor."""
     speed_matched_sampling: bool = True
     speed_match_window: float = 0.1
     """Pair every policy transition shown to the discriminator with a reference transition within
@@ -100,7 +106,10 @@ class RslRlAmpCfg:
 
     command_name: str | None = "base_velocity"
     command_gate: float = 0.1
-    """Zero the style reward below this commanded planar speed (standing environments)."""
+    """Below this commanded planar speed an environment gets no style reward and its transitions are not
+    shown to the discriminator. 0.1 excludes only the standing environments (``rel_standing_envs``), matching
+    ``_command_run_gate`` in the task rewards. Must not be below ``speed_range[0]``: a policy transition
+    slower than every reference transition would hand the discriminator speed as a cue again."""
 
     hidden_dims: tuple[int, ...] = (1024, 512)
     activation: str = "relu"
