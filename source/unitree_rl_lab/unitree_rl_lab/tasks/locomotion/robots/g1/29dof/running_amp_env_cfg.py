@@ -11,6 +11,15 @@ cannot lock onto the clock, so an exact-match reward would be noise. ``short_con
 it penalises stances longer than the running stance target without reading the clock, so it
 keeps the gait a run at every speed while AMP decides what the run looks like.
 
+One clock-free stepping reward is added in their place: ``feet_air_time_positive_biped`` (the
+term Isaac Lab's own G1/H1/Digit/Cassie locomotion configs use). It pays only while exactly one
+foot is on the ground, for the shorter of the swing foot's air time and the stance foot's
+contact time, capped at ``threshold``. Double support and flight both score zero, so it says
+"alternate your feet" without saying when or how fast. It is there because the first clock-free
+run (``2026-09-21_10-56-46``) found the cheapest way around ``short_contact``: hopping on both
+feet at once -- symmetric, never single-stance, hence never at risk of falling -- while the
+speed-matched reference at 0.15 m/s (people standing about) raised no objection.
+
 The rest -- scene, events, commands, actions, the other policy/critic terms, the remaining 19
 reward terms, terminations and curriculum -- is inherited unchanged. The comparison this arm
 supports is therefore "baseline with its hand-crafted gait terms replaced by AMP", not
@@ -27,10 +36,14 @@ so a policy trained here needs the ``deploy.yaml`` exported from its own run, an
 masking in the deploy stack does not apply to it.
 """
 
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
+from unitree_rl_lab.tasks.locomotion import mdp
 from unitree_rl_lab.tasks.locomotion.mdp.amp_observations import AmpObsCfg
 
+from .running_env_cfg import GAIT_FEET_BODY_NAMES
 from .running_env_cfg import ObservationsCfg as BaseObservationsCfg
 from .running_env_cfg import RewardsCfg as BaseRewardsCfg
 from .running_env_cfg import RobotEnvCfg as BaseRobotEnvCfg
@@ -62,10 +75,24 @@ class ObservationsCfg(BaseObservationsCfg):
 
 @configclass
 class RewardsCfg(BaseRewardsCfg):
-    """Baseline rewards without the two clock-driven gait terms. ``short_contact`` is kept."""
+    """Baseline rewards without the two clock-driven gait terms, plus one clock-free stepping term."""
 
     run_contact_pattern = None
     push_off = None
+
+    # Alternating single stance, no clock. Isaac Lab's G1 walking config uses weight 0.25 with a
+    # 0.4 s cap; running stances are ~0.25 s and this term has to beat the two-footed hop, so the
+    # cap is tightened to 0.3 s and the weight raised to 1.0 (the weight run_contact_pattern had).
+    # The function itself returns zero below a 0.1 m/s command, matching STAND_CMD_THRESHOLD.
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time_positive_biped,
+        weight=1.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=GAIT_FEET_BODY_NAMES),
+            "threshold": 0.3,
+        },
+    )
 
 
 @configclass
