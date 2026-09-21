@@ -9,6 +9,8 @@ from isaaclab.envs.mdp import UniformVelocityCommand, UniformVelocityCommandCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 
+from ..joint_coefficients import joint_coefficients
+
 
 @configclass
 class UniformLevelVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -35,19 +37,33 @@ class LoggedUniformLevelVelocityCommand(UniformVelocityCommand):
             ):
                 self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
 
-        self._cot_sample_count = torch.zeros(self.num_envs, device=self.device)
-        self._cot_energy_j = torch.zeros(self.num_envs, device=self.device)
+        self._cot_elec_energy_j = torch.zeros(self.num_envs, device=self.device)
+        self._cot_motor_nm2s = torch.zeros(self.num_envs, device=self.device)
+        self._cot_pos_energy_j = torch.zeros(self.num_envs, device=self.device)
         self._cot_distance_m = torch.zeros(self.num_envs, device=self.device)
+        self._k_el: torch.Tensor | None = None
         if self.cfg.log_energy_metrics:
             # Weight in Newton, used to make the cost of transport dimensionless.
             self._robot_weight_n = self.robot.data.default_mass.sum(dim=1).to(self.device) * 9.81
+            # The analysis set (2026-09-21): E_mech = positive motor work, E_motor = sum tau^2, their
+            # CoTs, plus the electrical CoT that adds heat and work on one scale. Braking work is
+            # never counted (no regenerative path on the G1). torque_sq_norm stays as the diagnostic
+            # for the joint_torque reward term, which normalizes by the effort limit.
             for metric_name in (
-                "energy/mech_power_w",
+                "energy/pos_mech_power_w",
                 "energy/torque_sq_norm",
-                "energy/cost_of_transport",
-                "energy/cot_integrated",
+                "energy/torque_sq_raw",
+                "energy/cot_pos_integrated",
+                "energy/cot_motor_integrated",
             ):
                 self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
+            if self.cfg.joule_coefficients is not None:
+                # Copper loss sum tau^2 k_el plus positive mechanical work, over distance. On a
+                # quasi-direct-drive legged robot the copper loss is the larger share, which the
+                # mechanical CoT cannot see. k_el is an estimate (see the robot asset), so this is
+                # for comparing runs, not for absolute claims.
+                self._k_el = joint_coefficients(self.robot, self.cfg.joule_coefficients)
+                self.metrics["energy/cot_elec_integrated"] = torch.zeros(self.num_envs, device=self.device)
 
         self._contact_sensor: ContactSensor | None = None
         if self.cfg.contact_sensor_name is not None:
@@ -83,8 +99,9 @@ class LoggedUniformLevelVelocityCommand(UniformVelocityCommand):
 
         extras = super().reset(env_ids)
         self._tracking_sample_count[env_ids] = 0.0
-        self._cot_sample_count[env_ids] = 0.0
-        self._cot_energy_j[env_ids] = 0.0
+        self._cot_elec_energy_j[env_ids] = 0.0
+        self._cot_motor_nm2s[env_ids] = 0.0
+        self._cot_pos_energy_j[env_ids] = 0.0
         self._cot_distance_m[env_ids] = 0.0
 
         if self._contact_sensor is not None:
@@ -130,40 +147,40 @@ class LoggedUniformLevelVelocityCommand(UniformVelocityCommand):
 
         if self.cfg.log_energy_metrics:
             torque = self.robot.data.applied_torque
-            power = torch.sum(torch.abs(torque * self.robot.data.joint_vel), dim=-1)
+            # Per-motor positive (motoring) work: E_mech rate, and the quantity the joint_power
+            # reward terms charge, so power_ref can be calibrated against it.
+            pos_power = torch.sum(torch.clamp_min(torque * self.robot.data.joint_vel, 0.0), dim=-1)
+            # E_motor rate: raw sum tau^2 [Nm^2], the motor-heating proxy without k_el. Proportional
+            # to copper loss only if every motor had the same k_el, so it is for comparing gaits and
+            # policies on this robot, not across robots.
+            torque_sq_raw = torch.sum(torch.square(torque), dim=-1)
             effort_limit = self.robot.data.joint_effort_limits.clamp_min(1e-6)
-            self._update_running_mean("energy/mech_power_w", power)
+            self._update_running_mean("energy/pos_mech_power_w", pos_power)
+            self._update_running_mean("energy/torque_sq_raw", torque_sq_raw)
             self._update_running_mean("energy/torque_sq_norm", torch.sum(torch.square(torque / effort_limit), dim=-1))
 
-            # Cost of transport is only meaningful while the robot is actually travelling,
-            # so it gets its own sample counter instead of the shared tracking one.
+            # Cost of transport is energy over distance, so it only accumulates while the robot is
+            # actually travelling; standing and the reset transient are excluded.
             speed = torch.linalg.norm(self.robot.data.root_lin_vel_w[:, :2], dim=-1)
             moving_fast = speed > self.cfg.cot_min_speed
             zero = torch.zeros_like(speed)
-            cot = power / (self._robot_weight_n * speed.clamp_min(self.cfg.cot_min_speed))
-            self._cot_sample_count += moving_fast.float()
-            old_cot = self.metrics["energy/cost_of_transport"]
-            self.metrics["energy/cost_of_transport"] = torch.where(
-                moving_fast,
-                old_cot + (cot - old_cot) / self._cot_sample_count.clamp_min(1.0),
-                old_cot,
-            )
-
-            # The physically meaningful estimator: energy actually spent over distance
-            # actually covered. The running mean above is a time-weighted average of
-            # instantaneous P/(m g v), which over-weights slow moments where 1/v blows up,
-            # so it reads systematically high and does not match eval_energy.py. Both are
-            # logged: this one is the number to compare across runs and against the
-            # offline sweep, the other is kept so existing curves stay continuous.
             step_dt = self._env.step_dt
-            self._cot_energy_j += torch.where(moving_fast, power * step_dt, zero)
             self._cot_distance_m += torch.where(moving_fast, speed * step_dt, zero)
             has_distance = self._cot_distance_m > 1e-3
-            self.metrics["energy/cot_integrated"] = torch.where(
-                has_distance,
-                self._cot_energy_j / (self._robot_weight_n * self._cot_distance_m.clamp_min(1e-3)),
-                zero,
-            )
+            mgd = self._robot_weight_n * self._cot_distance_m.clamp_min(1e-3)
+
+            # CoT_mech = int sum max(tau qdot, 0) dt / (m g d), dimensionless.
+            self._cot_pos_energy_j += torch.where(moving_fast, pos_power * step_dt, zero)
+            self.metrics["energy/cot_pos_integrated"] = torch.where(has_distance, self._cot_pos_energy_j / mgd, zero)
+            # CoT_motor = int sum tau^2 dt / (m g d). Units Nm*s, not dimensionless (see above).
+            self._cot_motor_nm2s += torch.where(moving_fast, torque_sq_raw * step_dt, zero)
+            self.metrics["energy/cot_motor_integrated"] = torch.where(has_distance, self._cot_motor_nm2s / mgd, zero)
+            if self._k_el is not None:
+                elec_power = torch.sum(torch.square(torque) * self._k_el, dim=-1) + pos_power
+                self._cot_elec_energy_j += torch.where(moving_fast, elec_power * step_dt, zero)
+                self.metrics["energy/cot_elec_integrated"] = torch.where(
+                    has_distance, self._cot_elec_energy_j / mgd, zero
+                )
 
         if self._contact_sensor is None:
             return
@@ -210,6 +227,9 @@ class LoggedUniformLevelVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     log_tracking_metrics: bool = False
     log_energy_metrics: bool = False
     cot_min_speed: float = 0.3
+    joule_coefficients: dict[str, float] | None = None
+    """{joint-name-regex: k_el [W/Nm^2]}; when set, also logs energy/cot_elec_integrated
+    (copper loss + positive mechanical work over distance)."""
     debug_vis_env_index: int | None = None
     contact_sensor_name: str | None = None
     feet_body_names: str | list[str] | None = None

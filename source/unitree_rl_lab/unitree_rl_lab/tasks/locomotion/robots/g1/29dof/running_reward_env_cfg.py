@@ -15,6 +15,7 @@ Measured against the baseline at matched training budget (both at iteration 2550
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
+from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_K_EL
 from unitree_rl_lab.tasks.locomotion import mdp
 
 from .running_env_cfg import RewardsCfg as BaseRewardsCfg
@@ -24,18 +25,24 @@ from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 # Both cost terms are normalized (power by ENERGY_POWER_REF_W, torque by each actuator's
 # effort limit), so the weights below are on the same scale as the task rewards
 # (track_lin_vel_xy = 2.0) instead of the usual hard-to-read 1e-5 range. Constant weights
-# from step 0, no ramp (user decision 2026-09-21; the earlier 1500->4000 iteration ramp was
-# meant to let the running gait form first, but with the current environment the gait
-# emerges long after the ramp would have finished, so it never did what it was for).
-# ENERGY_POWER_REF_W was calibrated from scripts/rsl_rl/eval_energy.py on the pure-reward
-# baseline (2026-09-08_17-13-58_try6/model_25500) on the *gross* power sum |tau qdot|: 230 W at
-# 1.0 m/s and 446 W at 2.0 m/s, with sum (tau/tau_limit)^2 at 0.95 and 1.45 respectively. At
-# 2.0 m/s the two terms were then worth about -0.22 and -0.15, i.e. ~10% of the roughly 3.6 of
-# positive reward. joint_power_l1 now charges positive work per motor only, which is smaller
-# than the gross sum, so the same power_ref gives less pressure than that; not yet recalibrated.
-ENERGY_POWER_REF_W = 400.0
-ENERGY_POWER_WEIGHT = -0.20
-ENERGY_TORQUE_WEIGHT = -0.10
+# from step 0, no ramp (user decision 2026-09-21).
+#
+# power_ref: joint_power_l1 charges per-motor positive work, which on the 2 m/s baseline gait is
+# an estimated 290-350 W (gross sum |tau qdot| was 446 W; per-motor braking share 20-35%).
+# 300 W puts the term near 1 there. Check against energy/pos_mech_power_w on the next run.
+#
+# Ratio (user decision 2026-09-21, after the 09-16 single-term runs and the 3:7 split):
+# torque above power. On a quasi-direct-drive robot copper loss is the larger share of battery
+# energy (roughly 7:3 vs mechanical work at the raw k_el estimate, 55:45 at scale 1/3), and the
+# 09-16 ablations at 14-16k iterations showed the two terms equally cost-effective on mechanical
+# CoT per unit of penalty (3.5% vs 3.4% per 0.1) while the torque term was 7x more effective on
+# sum (tau/tau_limit)^2 (14% vs 2% per 0.1) with no gait or tracking change up to -0.145.
+# At 2 m/s: power ~1.07 x 0.25 = -0.27, torque 1.45 x 0.35 = -0.51, total ~ -0.78, about 22% of
+# the ~3.6 of positive reward (was ~10% at -0.20/-0.10 on gross power). Watch base_height and
+# knee angle: a torque weight this high is untested and may straighten the knee.
+ENERGY_POWER_REF_W = 300.0
+ENERGY_POWER_WEIGHT = -0.25
+ENERGY_TORQUE_WEIGHT = -0.35
 
 
 @configclass
@@ -132,31 +139,19 @@ joints over a shared DC bus first. Same convention as the joint_power / joint_co
 For scale, the 2 m/s inspect_torque data gives gross sum |tau qdot| = 441 W and bus-net = 140 W;
 the per-motor positive figure lies between the two and has not been measured yet.
 
-Joule coefficients k_el = R / (r k_i)^2 are not published for the G1. They are estimated
-from the torque-speed curves in unitree_actuators.py: with kt_eff = V / X2 and R from the
-knee point, k_el = (X2 - X1) / Y1 [W/Nm^2] -- the bus voltage cancels. That slope also
-contains current limiting and field weakening, so it overstates R; a 7520-class motor's phase
-resistance implies roughly a third of the value, and at 1.0 the estimate puts 1.16 kW of copper
-loss on a 441 W gait. PACE_K_EL_SCALE = 1/3 is that correction, and it is an assumption: the
-hardware run (battery current vs. this term) is what pins the scale. The ratios between motor
-families are what shape the gait and those come from the curves directly:
-  N7520-14.3 (hip pitch/yaw, waist yaw)  0.18   N7520-22.5 (hip roll, knee)  0.074
-  N5020-16 (arm, ankle, waist roll/pitch) 0.37   W4010-25 (wrist pitch/yaw)   1.97
-Against the 1/tau_limit^2 weighting of joint_torque_normalized_l2 the hip:knee ratio is the
-same (1 : 0.4) but the small motors are weighted 6x and the wrists 28x less here.
+Joule coefficients k_el = R / (r k_i)^2 are UNITREE_G1_29DOF_K_EL in the robot asset, where
+their torque-speed-curve derivation and the 1/3 scale assumption are documented. Against the
+1/tau_limit^2 weighting of joint_torque_normalized_l2 the hip:knee ratio is the same (1 : 0.4)
+but the small motors are weighted 6x and the wrists 28x less here.
 
 Weight: at 2 m/s the term is gamma * P_total = (1/5) * (386 + 140) W ~ 105, and -3.5e-3 makes it
 ~ -0.37/s, the same ~10% of positive reward the other variants use at that speed. (The paper's
 -16e-5 is on a different reward scale and would be ~1% here.) Constant weight, no ramp.
 """
 
-PACE_K_EL_SCALE = 1.0 / 3.0  # T-N slope overstates R; see above. Calibrate on hardware.
-PACE_K_EL = {  # W/Nm^2, joint-referred, = (X2 - X1) / Y1 from unitree_actuators.py, times the scale
-    r"hip_pitch|hip_yaw|waist_yaw": 0.1815 * PACE_K_EL_SCALE,
-    r"hip_roll|knee": 0.0739 * PACE_K_EL_SCALE,
-    r"shoulder|elbow|wrist_roll|ankle|waist_roll|waist_pitch": 0.3738 * PACE_K_EL_SCALE,
-    r"wrist_pitch|wrist_yaw": 1.9708 * PACE_K_EL_SCALE,
-}
+# k_el (with its 1/3 scale assumption) lives with the robot asset so the reward and the
+# energy/elec_* metrics use the same numbers.
+PACE_K_EL = UNITREE_G1_29DOF_K_EL
 PACE_K_REGEN = 0.0  # per-motor braking work recovered at this efficiency; 0 = dissipated (no regen path on the G1)
 PACE_ENERGY_WEIGHT = -3.5e-3  # per Watt (after gamma); ~10% of positive reward at 2 m/s
 

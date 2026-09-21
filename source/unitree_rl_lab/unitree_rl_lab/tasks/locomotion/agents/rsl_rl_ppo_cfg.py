@@ -80,7 +80,7 @@ class RslRlAmpCfg:
     motion_files: list[str] = MISSING
     """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
     obs_group: str = "amp"
-    speed_range: tuple[float, float] = (0.0, 2.5)
+    speed_range: tuple[float, float] = (0.2, 2.5)
     """Planar-speed gate on reference transitions. The upper bound is the command ceiling. The lower bound
     admits everything down to standing: the study compares the arms at 2 m/s only, so a human-like *walk*
     at slow commands is acceptable (decision 2026-09-21). Two earlier floors are documented in the project

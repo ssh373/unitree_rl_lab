@@ -11,22 +11,21 @@ mix -- stay directly comparable. For each commanded forward speed the script hol
 command constant, discards a warm-up transient, and then integrates actuator cost over a
 fixed window.
 
-Reported per speed:
-    power_w        mean mechanical joint power, sum |tau * qdot|
-    cot            cost of transport, total energy / (weight * distance travelled)
-    torque_sq      mean sum (tau / tau_limit)^2, the I^2 R share
-    leg/arm/waist  split of power_w by joint group
-    speed_mps      achieved planar speed
-    track_err      |commanded - achieved| planar velocity
-    track_err_yaw  |commanded - achieved| yaw rate
-    ang_vel_xy_rms RMS roll/pitch rate of the trunk (trunk wobble)
-    contact_ratio  mean fraction of feet in contact; ~stance ratio for a run, >=0.5 for a walk
-    flight_ratio   fraction of steps with no foot in contact (a walk has none)
-    phase_match    agreement with the commanded alternating-contact pattern
-    survival       fraction of envs that never terminated during the window
+Reported per speed (ten columns, the analysis set agreed on 2026-09-21):
+    cmd_mps, speed_mps   commanded and achieved planar speed
+    pos_power_w          E_mech rate: per-motor positive mechanical power, sum max(tau * qdot, 0) [W]
+    cot_pos              CoT_mech = int E_mech dt / (m g d)   [dimensionless]
+    torque_sq_raw        E_motor rate: sum tau^2 [Nm^2], motor-heating proxy without k_el
+    cot_motor            CoT_motor = int sum tau^2 dt / (m g d)   [Nm s]; relative comparisons on this robot only
+    cot_elec             electrical CoT, (sum tau^2 k_el + E_mech) / (m g d) with the k_el estimate from the
+                         robot asset; the one number that adds heat and work on a common scale
+    track_err            |commanded - achieved| planar velocity
+    flight_ratio         fraction of steps with no foot in contact; a walk has none, so a policy that got
+                         cheaper by dropping the flight phase shows up here
+    survival             fraction of envs that never terminated during the window
 
-The gait columns are what distinguishes a policy that got cheaper from one that quietly
-stopped running: dropping the flight phase is the easiest way to lower mechanical cost.
+Braking work is not counted anywhere: the G1 has no regenerative path, so negative tau * qdot is
+assumed dissipated, the same convention as the joint_power reward terms.
 
 Example:
     python scripts/rsl_rl/eval_energy.py --task Unitree-G1-29dof-Running --headless \
@@ -85,14 +84,10 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
+from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_K_EL
+from unitree_rl_lab.tasks.locomotion.mdp.joint_coefficients import joint_coefficients
 from unitree_rl_lab.algorithms.registry import get_runner_class
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
-
-JOINT_GROUPS = {
-    "leg": [".*_hip_.*", ".*_knee_.*", ".*_ankle_.*"],
-    "arm": [".*_shoulder_.*", ".*_elbow_.*", ".*_wrist_.*"],
-    "waist": ["waist.*"],
-}
 
 GRAVITY = 9.81
 
@@ -156,17 +151,12 @@ def main():
     dt = base_env.step_dt
 
     weight_n = robot.data.default_mass.sum(dim=1).to(device) * GRAVITY
-    effort_limit = robot.data.joint_effort_limits.clamp_min(1e-6)
-    group_ids = {name: robot.find_joints(expr)[0] for name, expr in JOINT_GROUPS.items()}
+    k_el = joint_coefficients(robot, UNITREE_G1_29DOF_K_EL)
 
-    # Gait pattern comes from the same command config that defines the training metric,
-    # so eval and the wandb gait/ curves agree on what "running" means.
+    # The feet are the same bodies the training gait metrics use.
     cmd_cfg = env_cfg.commands.base_velocity
     contact_sensor = base_env.scene.sensors[cmd_cfg.contact_sensor_name]
     feet_ids, _ = contact_sensor.find_bodies(cmd_cfg.feet_body_names, preserve_order=True)
-    gait_offsets = torch.tensor(cmd_cfg.gait_offsets, device=device)
-    gait_period = cmd_cfg.gait_period
-    gait_stance_ratio = cmd_cfg.gait_stance_ratio
 
     window = args_cli.warmup_steps + args_cli.measure_steps
     max_steps = int(base_env.max_episode_length)
@@ -184,17 +174,13 @@ def main():
         _set_command_speed(base_env, speed)
 
         num_envs = base_env.num_envs
-        energy_j = torch.zeros(num_envs, device=device)
+        pos_energy_j = torch.zeros(num_envs, device=device)
+        joule_j = torch.zeros(num_envs, device=device)
+        torque_sq_raw_dt = torch.zeros(num_envs, device=device)
         distance_m = torch.zeros(num_envs, device=device)
-        torque_sq = torch.zeros(num_envs, device=device)
         speed_sum = torch.zeros(num_envs, device=device)
         track_err_sum = torch.zeros(num_envs, device=device)
-        track_err_yaw_sum = torch.zeros(num_envs, device=device)
-        ang_vel_xy_sq_sum = torch.zeros(num_envs, device=device)
-        contact_sum = torch.zeros(num_envs, device=device)
         flight_sum = torch.zeros(num_envs, device=device)
-        phase_match_sum = torch.zeros(num_envs, device=device)
-        group_energy = {name: torch.zeros(num_envs, device=device) for name in group_ids}
         valid = torch.ones(num_envs, dtype=torch.bool, device=device)
 
         # The reset has to happen inside inference mode: the runner already produced
@@ -215,32 +201,20 @@ def main():
                 valid &= ~dones.bool()
 
                 torque = robot.data.applied_torque
-                joint_power = torch.abs(torque * robot.data.joint_vel)
-                power = joint_power.sum(dim=-1)
-                planar_vel = robot.data.root_lin_vel_w[:, :2]
-                planar_speed = torch.linalg.norm(planar_vel, dim=-1)
-                command = base_env.command_manager.get_command("base_velocity")
-                command_xy = command[:, :2]
-                ang_vel_b = robot.data.root_ang_vel_b
-
-                # Every env reset together at step 0, so the global phase is shared; envs that
-                # fell and auto-reset mid-window are already excluded through `valid`.
+                pos_power = torch.clamp_min(torque * robot.data.joint_vel, 0.0).sum(dim=-1)
+                torque_sq_raw = torch.square(torque).sum(dim=-1)
+                joule_power = (torch.square(torque) * k_el).sum(dim=-1)
+                planar_speed = torch.linalg.norm(robot.data.root_lin_vel_w[:, :2], dim=-1)
+                command_xy = base_env.command_manager.get_command("base_velocity")[:, :2]
                 is_contact = contact_sensor.data.current_contact_time[:, feet_ids] > 0.0
-                global_phase = (base_env.episode_length_buf * dt) % gait_period / gait_period
-                expected_contact = (global_phase.unsqueeze(1) + gait_offsets).remainder(1.0) < gait_stance_ratio
 
-                energy_j += power * dt
+                pos_energy_j += pos_power * dt
+                joule_j += joule_power * dt
+                torque_sq_raw_dt += torque_sq_raw * dt
                 distance_m += planar_speed * dt
-                torque_sq += torch.square(torque / effort_limit).sum(dim=-1)
                 speed_sum += planar_speed
                 track_err_sum += torch.linalg.norm(command_xy - robot.data.root_lin_vel_b[:, :2], dim=-1)
-                track_err_yaw_sum += torch.abs(command[:, 2] - ang_vel_b[:, 2])
-                ang_vel_xy_sq_sum += torch.square(ang_vel_b[:, :2]).sum(dim=-1)
-                contact_sum += is_contact.float().mean(dim=1)
                 flight_sum += (~is_contact).all(dim=1).float()
-                phase_match_sum += (expected_contact == is_contact).float().mean(dim=1)
-                for name, ids in group_ids.items():
-                    group_energy[name] += joint_power[:, ids].sum(dim=-1) * dt
 
         n = float(args_cli.measure_steps)
         survival = valid.float().mean().item()
@@ -251,31 +225,25 @@ def main():
         def m(tensor):
             return tensor[valid].mean().item()
 
+        mgd = weight_n * distance_m.clamp_min(1e-6)
         row = {
             "cmd_mps": speed,
             "speed_mps": m(speed_sum) / n,
-            "power_w": m(energy_j) / (n * dt),
-            "cot": m(energy_j / (weight_n * distance_m.clamp_min(1e-6))),
-            "torque_sq": m(torque_sq) / n,
-            "leg_w": m(group_energy["leg"]) / (n * dt),
-            "arm_w": m(group_energy["arm"]) / (n * dt),
-            "waist_w": m(group_energy["waist"]) / (n * dt),
+            "pos_power_w": m(pos_energy_j) / (n * dt),
+            "cot_pos": m(pos_energy_j / mgd),
+            "torque_sq_raw": m(torque_sq_raw_dt) / (n * dt),
+            "cot_motor": m(torque_sq_raw_dt / mgd),
+            "cot_elec": m((joule_j + pos_energy_j) / mgd),
             "track_err": m(track_err_sum) / n,
-            "track_err_yaw": m(track_err_yaw_sum) / n,
-            "ang_vel_xy_rms": (m(ang_vel_xy_sq_sum) / n) ** 0.5,
-            "contact_ratio": m(contact_sum) / n,
             "flight_ratio": m(flight_sum) / n,
-            "phase_match": m(phase_match_sum) / n,
             "survival": survival,
         }
         rows.append(row)
         print(
             f"cmd {row['cmd_mps']:4.2f} | act {row['speed_mps']:5.2f} m/s | "
-            f"P {row['power_w']:7.1f} W | CoT {row['cot']:5.3f} | tau^2 {row['torque_sq']:5.2f} | "
-            f"leg {row['leg_w']:6.1f} arm {row['arm_w']:5.1f} waist {row['waist_w']:5.1f} W | "
-            f"err {row['track_err']:4.2f} yaw {row['track_err_yaw']:4.2f} | "
-            f"contact {row['contact_ratio']:.2f} flight {row['flight_ratio']:.2f} "
-            f"phase {row['phase_match']:.2f} | alive {row['survival']:.2f}"
+            f"P+ {row['pos_power_w']:6.1f} W | CoT_mech {row['cot_pos']:5.3f} | "
+            f"tau^2 {row['torque_sq_raw']:7.0f} | CoT_motor {row['cot_motor']:6.1f} | CoT_el {row['cot_elec']:5.3f} | "
+            f"err {row['track_err']:4.2f} | flight {row['flight_ratio']:.2f} | alive {row['survival']:.2f}"
         )
 
     if rows:

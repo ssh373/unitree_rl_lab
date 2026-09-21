@@ -530,6 +530,28 @@ DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ  # 2.557
 DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ  # 6.3088018534966395
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ  # 1.06814150219
 
+# Joint-referred Joule-heating coefficients k_el = R / (r k_i)^2 [W/Nm^2] per motor family, so that
+# copper loss is sum_j tau_j^2 * k_el_j. Not published for the G1; estimated from the torque-speed
+# curves of the actuators above: with kt_eff = V / X2 and R from the knee point,
+# k_el = (X2 - X1) / Y1 and the bus voltage cancels. That raw slope also contains current limiting
+# and field weakening, so it overstates R; a 7520-class phase resistance implies roughly a third of
+# it, and at scale 1.0 the estimate puts 1.16 kW of copper loss on a 441 W running gait.
+# UNITREE_G1_29DOF_K_EL_SCALE is that correction and it is an ASSUMPTION until a hardware run
+# (battery current vs. the model) pins it. The ratios between motor families come straight from
+# the curves and are the reliable part:
+#   N7520-14.3 (hip pitch/yaw, waist yaw)   0.18    N7520-22.5 (hip roll, knee)   0.074
+#   N5020-16 (arm, ankle, waist roll/pitch) 0.37    W4010-25 (wrist pitch/yaw)    1.97
+# Used by the PACE reward term and by the reward-independent energy/elec_* metrics.
+UNITREE_G1_29DOF_K_EL_RAW = {
+    r"hip_pitch|hip_yaw|waist_yaw": 0.1815,
+    r"hip_roll|knee": 0.0739,
+    r"shoulder|elbow|wrist_roll|ankle|waist_roll|waist_pitch": 0.3738,
+    r"wrist_pitch|wrist_yaw": 1.9708,
+}
+UNITREE_G1_29DOF_K_EL_SCALE = 1.0 / 3.0
+UNITREE_G1_29DOF_K_EL = {k: v * UNITREE_G1_29DOF_K_EL_SCALE for k, v in UNITREE_G1_29DOF_K_EL_RAW.items()}
+
+
 UNITREE_G1_29DOF_MIMIC_CFG = UnitreeArticulationCfg(
     # spawn=UnitreeUrdfFileCfg(
     #     asset_path=f"{UNITREE_ROS_DIR}/robots/g1_description/g1_29dof_rev_1_0.urdf",

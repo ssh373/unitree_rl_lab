@@ -11,6 +11,8 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
+from .joint_coefficients import joint_coefficients
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -30,7 +32,7 @@ def energy(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("r
 
 def joint_power_l1(
     env: ManagerBasedRLEnv,
-    power_ref: float = 500.0,
+    power_ref: float = 300.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Positive mechanical joint power ``sum max(tau * qdot, 0)`` normalized by a reference power.
@@ -40,9 +42,8 @@ def joint_power_l1(
     recovered, so it costs nothing here: the G1 has no regenerative path to the battery, and
     charging |tau * qdot| would penalize the eccentric phases of a gait as if they drew power.
     Divided by ``power_ref`` (in Watt) so the term stays O(1) and its weight is directly
-    comparable with the tracking rewards. Note that the ``energy/mech_power_w`` diagnostic
-    logged by the velocity command term is the gross ``sum |tau * qdot|``, so it is an upper
-    bound of this quantity, not the same number.
+    comparable with the tracking rewards. The ``energy/pos_mech_power_w`` diagnostic logged by
+    the velocity command term is this same quantity in Watt; calibrate ``power_ref`` from it.
     """
     asset: Articulation = env.scene[asset_cfg.name]
 
@@ -114,22 +115,6 @@ def joint_power_cot_exp(
     return 1.0 - torch.exp(-power / speed_scale.clamp_min(sigma_lin * v_floor))
 
 
-def _joint_coefficients(asset: Articulation, mapping: dict[str, float], joint_ids) -> torch.Tensor:
-    """Expand a {joint-name-regex: value} mapping to a per-joint tensor in joint order."""
-    import re
-
-    names = [asset.joint_names[i] for i in (range(asset.num_joints) if joint_ids == slice(None) else joint_ids)]
-    out = torch.zeros(len(names), device=asset.device)
-    for j, name in enumerate(names):
-        for pattern, value in mapping.items():
-            if re.search(pattern, name):
-                out[j] = value
-                break
-        else:
-            raise KeyError(f"no coefficient matches joint '{name}'")
-    return out
-
-
 def pace_total_power(
     env: ManagerBasedRLEnv,
     k_el: dict[str, float],
@@ -162,7 +147,7 @@ def pace_total_power(
     qdot = asset.data.joint_vel[:, asset_cfg.joint_ids]
 
     if not hasattr(env, "_pace_k_el"):
-        env._pace_k_el = _joint_coefficients(asset, k_el, asset_cfg.joint_ids)
+        env._pace_k_el = joint_coefficients(asset, k_el, asset_cfg.joint_ids)
     p_el = torch.sum(torch.square(tau) * env._pace_k_el, dim=-1)
 
     # Per-motor sign test: motoring work in full, braking work only at the regeneration

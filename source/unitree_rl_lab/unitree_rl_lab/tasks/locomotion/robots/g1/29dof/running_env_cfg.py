@@ -20,6 +20,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.utils.noise import NoiseModelWithAdditiveBiasCfg
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
+from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_K_EL
 from unitree_rl_lab.tasks.locomotion import mdp
 
 GAIT_PERIOD = 0.5
@@ -252,6 +253,9 @@ class CommandsCfg:
         # Measurement only -- these metrics never enter the reward, so they stay on in the
         # baseline too. Without them a baseline run has no energy curve to compare against.
         log_energy_metrics=True,
+        # Electrical view (copper loss + positive work) next to the mechanical one; k_el is the
+        # estimate documented in the robot asset. Measurement only, never in a reward.
+        joule_coefficients=UNITREE_G1_29DOF_K_EL,
         contact_sensor_name="contact_forces",
         feet_body_names=GAIT_FEET_BODY_NAMES,
         gait_period=GAIT_PERIOD,

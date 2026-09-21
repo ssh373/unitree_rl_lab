@@ -39,9 +39,9 @@ GRID = "#e3e2de"
 
 # (csv column, panel title, y-axis label, lower-is-better)
 PANELS = [
-    ("cot", "Cost of transport", "E / (m g d)   [dimensionless]", True),
-    ("power_w", "Mechanical power", "sum |tau q'|   [W]", True),
-    ("torque_sq", "Normalized torque squared", "sum (tau / tau_limit)^2", True),
+    ("cot_pos", "CoT_mech (positive motor work)", "int sum max(tau q', 0) dt / (m g d)", True),
+    ("cot_motor", "CoT_motor (sum tau^2)", "int sum tau^2 dt / (m g d)   [Nm s]", True),
+    ("cot_elec", "Electrical CoT (k_el estimate)", "(sum tau^2 k_el + E_mech) / (m g d)", True),
     ("track_err", "Velocity tracking error", "|cmd - actual|   [m/s]", True),
 ]
 
@@ -80,7 +80,7 @@ def main():
         )
 
     baseline_label, baseline_rows = series[0]
-    baseline_cot = {row["cmd_mps"]: row["cot"] for row in baseline_rows}
+    baseline_cot = {row["cmd_mps"]: row["cot_pos"] for row in baseline_rows}
 
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.0), facecolor=SURFACE)
     fig.patch.set_facecolor(SURFACE)
@@ -132,10 +132,10 @@ def main():
                     base = baseline_cot.get(row["cmd_mps"])
                     if base is None:
                         continue
-                    delta = (row["cot"] - base) / base * 100.0
+                    delta = (row["cot_pos"] - base) / base * 100.0
                     ax.annotate(
                         f"{delta:+.0f}%",
-                        (row["cmd_mps"], row["cot"]),
+                        (row["cmd_mps"], row["cot_pos"]),
                         textcoords="offset points",
                         xytext=(0, -15 if delta < 0 else 9),
                         ha="center",
@@ -178,10 +178,10 @@ def main():
 
     # A table view so the figure is never the only way to read the numbers.
     columns = [
-        "cmd_mps", "speed_mps", "cot", "power_w", "torque_sq", "track_err", "track_err_yaw",
-        "contact_ratio", "flight_ratio", "phase_match", "survival",
+        "cmd_mps", "speed_mps", "pos_power_w", "cot_pos", "torque_sq_raw", "cot_motor", "cot_elec",
+        "track_err", "flight_ratio", "survival",
     ]
-    # Older CSVs predate the gait columns; keep them readable instead of crashing.
+    # Older CSVs use the pre-2026-09-21 column set; keep them readable instead of crashing.
     columns = [c for c in columns if all(c in row for _, rows in series for row in rows)]
     for label, rows in series:
         print(f"\n--- {label}")
