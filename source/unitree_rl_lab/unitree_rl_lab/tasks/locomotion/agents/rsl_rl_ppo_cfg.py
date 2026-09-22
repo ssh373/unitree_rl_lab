@@ -94,8 +94,11 @@ class RslRlAmpCfg:
     ``±speed_match_window`` m/s of its speed, so the discriminator cannot separate the two sides by speed
     (first run with uniform sampling and weight 0.5 ran at 0.7 m/s regardless of a 0.2 m/s command)."""
 
-    reward_weight: float = 0.2
-    """Final weight of the style reward; the task rewards keep their baseline weights."""
+    reward_weight: float = 2.0
+    """Final weight of the style reward in reward-manager units (the extension multiplies it by ``step_dt``
+    like every task reward weight), so 2.0 puts a saturated style reward on a par with ``track_lin_vel_xy``.
+    Until 2026-09-22 the dt factor was missing and the old default 0.2 acted as a weight of 10: the style
+    term (~4/s) outweighed the whole task reward and policies stood still on the slowest reference frames."""
     reward_weight_start: float = 0.0
     ramp_start_iter: int = 0
     ramp_end_iter: int = 0

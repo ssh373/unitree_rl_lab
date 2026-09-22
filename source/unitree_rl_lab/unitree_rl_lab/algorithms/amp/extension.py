@@ -1,7 +1,7 @@
 """AMP as a :class:`~unitree_rl_lab.algorithms.extensions.PPOExtension`.
 
 Per environment step the discriminator scores the ``amp`` observation group -- the
-``(s_{t-1}, s_t)`` pair that the step just produced -- and ``reward_weight * style_reward`` is
+``(s_{t-1}, s_t)`` pair that the step just produced -- and ``reward_weight * step_dt * style_reward`` is
 added to the task reward. After every PPO update the discriminator is trained on transitions from
 the rollout that was just collected against transitions from the reference motions.
 
@@ -57,7 +57,7 @@ class AMPExtension(PPOExtension):
         speed_range: tuple[float, float] = (0.2, 2.5),
         speed_matched_sampling: bool = True,
         speed_match_window: float = 0.1,
-        reward_weight: float = 0.2,
+        reward_weight: float = 2.0,
         reward_weight_start: float = 0.0,
         ramp_start_iter: int = 0,
         ramp_end_iter: int = 0,
@@ -83,7 +83,8 @@ class AMPExtension(PPOExtension):
                 speed of the policy transition it is paired with (see
                 :meth:`AmpMotionData.sample_matched`), so speed itself is not a discriminative cue.
             speed_match_window: Half-width in m/s of the speed window used for matching.
-            reward_weight: Final weight of the style reward relative to the task reward.
+            reward_weight: Final weight of the style reward, in reward-manager units (scaled by
+                ``step_dt`` like every task reward weight; 2.0 matches ``track_lin_vel_xy``).
             reward_weight_start: Weight at ``ramp_start_iter``; ignored when the ramp is disabled.
             ramp_start_iter / ramp_end_iter: PPO iterations over which the weight ramps linearly.
             command_name / command_gate: Zero the style reward when the planar speed command is below
@@ -197,7 +198,12 @@ class AMPExtension(PPOExtension):
         self._gate_masks.append(gated.to(style.device))
         self._style_reward_sum += style.sum()
         self._style_reward_count += style.numel()
-        return rewards + self.reward_weight * style.to(rewards.device).view_as(rewards)
+        # Isaac Lab's RewardManager multiplies every task weight by step_dt (0.02 s), so scale the
+        # style term the same way; ``reward_weight`` is then in the same units as the task reward
+        # weights (2.0 = parity with ``track_lin_vel_xy``). Before 2026-09-22 the dt was missing,
+        # so 0.2 acted like a weight of 10 and the style term outweighed the whole task reward.
+        dt = self._env.unwrapped.step_dt if self._env is not None else 1.0
+        return rewards + self.reward_weight * dt * style.to(rewards.device).view_as(rewards)
 
     # -- discriminator training ----------------------------------------------------------------
 

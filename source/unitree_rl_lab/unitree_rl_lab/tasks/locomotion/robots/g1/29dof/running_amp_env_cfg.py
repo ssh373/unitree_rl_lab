@@ -101,9 +101,12 @@ class RewardsCfg(BaseRewardsCfg):
 # curriculum threshold, so the command range never left 1.0 and the policy never saw the
 # speeds the reference covers. Asymmetric on purpose -- backward commands (reference has no
 # sustained backward running) arrive only after the upper bound has climbed; the lower bound
-# reaches -1.0 after 18 levels, the upper bound 2.5 after 13. limit_ranges are untouched, so
+# reaches -1.0 after 6 levels, the upper bound 2.5 after 13. limit_ranges are untouched, so
 # the final command distribution is the same as every other arm.
-AMP_START_LIN_VEL_X = (0.8, 1.2)
+# Lower bound back at the baseline's -0.4 (2026-09-22): the (0.8, 1.2) run stood only because the
+# then-oversized style reward paid for standing still; with the style term in task units the slow
+# commands are what let the policy learn balance first (the 0.4-start runs stood at iter 200-800).
+AMP_START_LIN_VEL_X = (-0.4, 1.2)
 
 
 @configclass
