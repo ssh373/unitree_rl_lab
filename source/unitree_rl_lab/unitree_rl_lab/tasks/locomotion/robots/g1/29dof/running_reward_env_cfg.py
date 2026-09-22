@@ -12,20 +12,29 @@ Measured against the baseline at matched training budget (both at iteration 2550
 0.014 m/s of extra velocity tracking error at low speed.
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_K_EL
 from unitree_rl_lab.tasks.locomotion import mdp
 
+from .running_env_cfg import CurriculumCfg as BaseCurriculumCfg
 from .running_env_cfg import RewardsCfg as BaseRewardsCfg
 from .running_env_cfg import RobotEnvCfg as BaseRobotEnvCfg
 from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 
 # Both cost terms are normalized (power by ENERGY_POWER_REF_W, torque by each actuator's
 # effort limit), so the weights below are on the same scale as the task rewards
-# (track_lin_vel_xy = 2.0) instead of the usual hard-to-read 1e-5 range. Constant weights
-# from step 0, no ramp (user decision 2026-09-21).
+# (track_lin_vel_xy = 2.0) instead of the usual hard-to-read 1e-5 range.
+#
+# Switch-on: every energy term starts at weight 0 and is gated on standing (user decision
+# 2026-09-22, see mdp.reward_weight_after_standing). The 09-21 wandb runs showed why: with the
+# penalties on from step 0 the falling phase, which earns ~0.1/step, carried a 0.03-0.07/step
+# penalty, and the first stand moved from 4.3k iterations (baseline) to 6k (-0.20/-0.10), 10.6k
+# (-0.40/-0.20) and beyond 12k (-0.25/-0.35 and PACE). Once standing, the same penalties were
+# never a problem (~3.6/step of positive reward against 0.3-0.8). The gate opens when the mean
+# episode length passes STAND_EP_LEN and ramps the weights in over STAND_RAMP_ITERS iterations.
 #
 # power_ref: joint_power_l1 charges per-motor positive work, which on the 2 m/s baseline gait is
 # an estimated 290-350 W (gross sum |tau qdot| was 446 W; per-motor braking share 20-35%).
@@ -43,32 +52,58 @@ from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 ENERGY_POWER_REF_W = 300.0
 ENERGY_POWER_WEIGHT = -0.25
 ENERGY_TORQUE_WEIGHT = -0.35
+STAND_EP_LEN = 500.0  # steps; half the 1000-step episode. Falling runs sit at 50-130.
+STAND_RAMP_ITERS = 500
+
+
+def _gate(term_name: str, end_weight: float) -> CurrTerm:
+    """Standing gate shared by every energy variant, so the switch-on can never drift."""
+    return CurrTerm(
+        func=mdp.reward_weight_after_standing,
+        params={
+            "term_name": term_name,
+            "end_weight": end_weight,
+            "ep_len_threshold": STAND_EP_LEN,
+            "ramp_iters": STAND_RAMP_ITERS,
+        },
+    )
 
 
 @configclass
 class RewardsCfg(BaseRewardsCfg):
-    """Baseline reward terms plus the two actuation-cost penalties."""
+    """Baseline reward terms plus the two actuation-cost penalties (weights set by the gate)."""
 
     # joint_power is the positive mechanical work; joint_torque is the I^2 R share that
     # mechanical power misses, and is what reaches joints that hold load without doing work
     # (waist_roll draws 0.7% of total power but sits at 79% of its effort limit).
+    # Both start at 0 -- RewardManager skips zero-weight terms, so before the gate opens this
+    # is bit-identical to the baseline objective.
     joint_power = RewTerm(
         func=mdp.joint_power_l1,
-        weight=ENERGY_POWER_WEIGHT,
+        weight=0.0,
         params={"power_ref": ENERGY_POWER_REF_W},
     )
-    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=ENERGY_TORQUE_WEIGHT)
+    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=0.0)
+
+
+@configclass
+class CurriculumCfg(BaseCurriculumCfg):
+    """Baseline curriculum plus the standing gate for the two cost terms."""
+
+    joint_power_weight = _gate("joint_power", ENERGY_POWER_WEIGHT)
+    joint_torque_weight = _gate("joint_torque", ENERGY_TORQUE_WEIGHT)
 
 
 @configclass
 class RobotEnvCfg(BaseRobotEnvCfg):
-    # Curriculum inherited from the baseline: terrain and command levels only.
     rewards: RewardsCfg = RewardsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
 
 @configclass
 class RobotPlayEnvCfg(BaseRobotPlayEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
 
 """
@@ -79,8 +114,7 @@ slowest -- and least efficient -- commands get the least pressure. ``joint_cot``
 adaptive energy regularization of Liang et al. (2024), a per-step cost of transport, on top of
 them. It is a separate task so the combined Running-Reward configuration stays untouched.
 
-Constant weights, like Running-Reward. If this variant fails to stand within ~8k iterations,
-a gate on episode length is the fix, not a linear schedule.
+All three terms are gated on standing like Running-Reward, then held at their final weights.
 
 Weight: at 2 m/s the baseline's 446 W gives an exponent of 446/(2800*1.98) = 0.080 and a cost
 of 0.077, so -1.5 adds -0.12 to the existing -0.37 of energy pressure (13% of the ~3.6 of
@@ -97,17 +131,17 @@ ENERGY_COT_WEIGHT = -1.0  # = Liang et al.'s alpha_en; -1.5 made a stiff heel wa
 
 @configclass
 class CotRewardsCfg(BaseRewardsCfg):
-    """Power + torque at their final weights, plus the speed-normalized power cost."""
+    """Power + torque plus the speed-normalized power cost; all three weights set by the gate."""
 
     joint_power = RewTerm(
         func=mdp.joint_power_l1,
-        weight=ENERGY_POWER_WEIGHT,
+        weight=0.0,
         params={"power_ref": ENERGY_POWER_REF_W},
     )
-    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=ENERGY_TORQUE_WEIGHT)
+    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=0.0)
     joint_cot = RewTerm(
         func=mdp.joint_power_cot_exp,
-        weight=ENERGY_COT_WEIGHT,
+        weight=0.0,
         params={
             "sigma_lin": ENERGY_COT_SIGMA_LIN,
             "sigma_ang": ENERGY_COT_SIGMA_ANG,
@@ -117,14 +151,22 @@ class CotRewardsCfg(BaseRewardsCfg):
 
 
 @configclass
+class CotCurriculumCfg(BaseCurriculumCfg):
+    joint_power_weight = _gate("joint_power", ENERGY_POWER_WEIGHT)
+    joint_torque_weight = _gate("joint_torque", ENERGY_TORQUE_WEIGHT)
+    joint_cot_weight = _gate("joint_cot", ENERGY_COT_WEIGHT)
+
+
+@configclass
 class CotEnvCfg(BaseRobotEnvCfg):
-    # Curriculum is inherited from the baseline: terrain and command levels only, no ramp.
     rewards: CotRewardsCfg = CotRewardsCfg()
+    curriculum: CotCurriculumCfg = CotCurriculumCfg()
 
 
 @configclass
 class CotPlayEnvCfg(BaseRobotPlayEnvCfg):
     rewards: CotRewardsCfg = CotRewardsCfg()
+    curriculum: CotCurriculumCfg = CotCurriculumCfg()
 
 
 """
@@ -146,7 +188,8 @@ but the small motors are weighted 6x and the wrists 28x less here.
 
 Weight: at 2 m/s the term is gamma * P_total = (1/5) * (386 + 140) W ~ 105, and -3.5e-3 makes it
 ~ -0.37/s, the same ~10% of positive reward the other variants use at that speed. (The paper's
--16e-5 is on a different reward scale and would be ~1% here.) Constant weight, no ramp.
+-16e-5 is on a different reward scale and would be ~1% here.) Gated on standing like the
+other variants: the 09-21 PACE run with the weight on from step 0 had not stood by 12k iterations.
 """
 
 # k_el (with its 1/3 scale assumption) lives with the robot asset so the reward and the
@@ -158,21 +201,27 @@ PACE_ENERGY_WEIGHT = -3.5e-3  # per Watt (after gamma); ~10% of positive reward 
 
 @configclass
 class PaceRewardsCfg(BaseRewardsCfg):
-    """Baseline terms plus the single PACE power cost; no joint_power / joint_torque."""
+    """Baseline terms plus the single PACE power cost (weight set by the gate); no joint_power / joint_torque."""
 
     joint_energy_pace = RewTerm(
         func=mdp.pace_energy_cost,
-        weight=PACE_ENERGY_WEIGHT,
+        weight=0.0,
         params={"k_el": PACE_K_EL, "k_regen": PACE_K_REGEN, "include_potential": False},
     )
 
 
 @configclass
+class PaceCurriculumCfg(BaseCurriculumCfg):
+    joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
+
+
+@configclass
 class PaceEnvCfg(BaseRobotEnvCfg):
-    # Curriculum inherited from the baseline: no energy ramp.
     rewards: PaceRewardsCfg = PaceRewardsCfg()
+    curriculum: PaceCurriculumCfg = PaceCurriculumCfg()
 
 
 @configclass
 class PacePlayEnvCfg(BaseRobotPlayEnvCfg):
     rewards: PaceRewardsCfg = PaceRewardsCfg()
+    curriculum: PaceCurriculumCfg = PaceCurriculumCfg()

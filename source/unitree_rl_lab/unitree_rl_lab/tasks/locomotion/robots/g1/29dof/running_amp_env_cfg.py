@@ -95,10 +95,25 @@ class RewardsCfg(BaseRewardsCfg):
     )
 
 
+# Where the velocity curriculum starts. The baseline starts at (-0.4, 0.4); the AMP arm starts
+# around 1.0 m/s (user decision 2026-09-22) because the reference clips run at >= 1.0 m/s and the
+# 09-21 run that started at 0.4 settled into a walk there: walking tracked at 1.36 < the 1.6
+# curriculum threshold, so the command range never left 1.0 and the policy never saw the
+# speeds the reference covers. Asymmetric on purpose -- backward commands (reference has no
+# sustained backward running) arrive only after the upper bound has climbed; the lower bound
+# reaches -1.0 after 18 levels, the upper bound 2.5 after 13. limit_ranges are untouched, so
+# the final command distribution is the same as every other arm.
+AMP_START_LIN_VEL_X = (0.8, 1.2)
+
+
 @configclass
 class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.ranges.lin_vel_x = AMP_START_LIN_VEL_X
 
 
 @configclass

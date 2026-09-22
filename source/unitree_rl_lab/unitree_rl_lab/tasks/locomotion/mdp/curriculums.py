@@ -90,3 +90,70 @@ def reward_weight_linear_schedule(
     term_cfg.weight = start_weight + alpha * (end_weight - start_weight)
 
     return torch.tensor(term_cfg.weight, device=env.device)
+
+
+def reward_weight_after_standing(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    end_weight: float,
+    ep_len_threshold: float = 500.0,
+    ramp_iters: int = 500,
+    steps_per_iter: int = 24,
+) -> torch.Tensor:
+    """Keep a reward term at zero weight until the policy can stand, then ramp it in.
+
+    Standing is detected from the mean length of the last ``num_envs`` finished episodes
+    exceeding ``ep_len_threshold`` steps. The gate latches: once open it never closes, so a
+    later dip in episode length cannot toggle the penalty on and off. After opening, the weight
+    ramps linearly from 0 to ``end_weight`` over ``ramp_iters`` PPO iterations
+    (``steps_per_iter`` environment steps each) so the value function sees a gradual change in
+    return scale rather than a step.
+
+    Why not a fixed-iteration ramp: the time to first stand varies from 0.3k to 11k iterations
+    between otherwise identical runs, and the energy penalties themselves delay it (the falling
+    phase earns ~0.1 of reward per step, so a 0.05 penalty is half the signal), so a schedule
+    tied to iteration count either fires before standing or long after. Tied to standing, the
+    pre-standing phase is bit-identical to a run without the term.
+
+    All terms using this function share one episode-length tracker and one latch on the env, so
+    several penalties open together.
+    """
+    state = getattr(env, "_standing_gate_state", None)
+    if state is None:
+        state = {
+            "lengths": torch.zeros(env.num_envs, device=env.device),
+            "ptr": 0,
+            "count": 0,
+            "last_step": -1,
+            "opened_step": None,
+        }
+        env._standing_gate_state = state
+
+    # Update the episode-length history once per environment step, even if several terms call
+    # this function for the same reset batch. episode_length_buf still holds the finished
+    # lengths here: ManagerBasedRLEnv._reset_idx runs the curriculum before zeroing it.
+    if state["last_step"] != env.common_step_counter:
+        state["last_step"] = env.common_step_counter
+        ids = torch.as_tensor(env_ids, device=env.device)
+        lengths = env.episode_length_buf[ids].float()
+        n = len(lengths)
+        if n > 0:
+            idx = (state["ptr"] + torch.arange(n, device=env.device)) % env.num_envs
+            state["lengths"][idx] = lengths
+            state["ptr"] = int((state["ptr"] + n) % env.num_envs)
+            state["count"] = min(state["count"] + n, env.num_envs)
+        if state["opened_step"] is None and state["count"] > 0:
+            mean_len = state["lengths"][: state["count"]].mean().item()
+            if mean_len > ep_len_threshold:
+                state["opened_step"] = env.common_step_counter
+
+    if state["opened_step"] is None:
+        alpha = 0.0
+    else:
+        ramp_steps = max(ramp_iters * steps_per_iter, 1)
+        alpha = min((env.common_step_counter - state["opened_step"]) / ramp_steps, 1.0)
+
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    term_cfg.weight = alpha * end_weight
+    return torch.tensor(term_cfg.weight, device=env.device)
