@@ -133,17 +133,24 @@ def reward_weight_after_standing(
     # Update the episode-length history once per environment step, even if several terms call
     # this function for the same reset batch. episode_length_buf still holds the finished
     # lengths here: ManagerBasedRLEnv._reset_idx runs the curriculum before zeroing it.
+    # rsl_rl's ``learn(init_at_random_ep_len=True)`` (used by scripts/rsl_rl/train.py) fills
+    # episode_length_buf with uniform 0..max_episode_length offsets at iteration 0, so every
+    # episode that ends within the first max_episode_length steps reports an inflated length
+    # (mean ~500 regardless of the policy). Skip those, and only judge once the tracker holds
+    # num_envs genuine episodes -- otherwise the very first reset batch decides the latch
+    # (the 09-22 s04/s06 runs opened at iteration ~2 with episodes 10 steps long).
     if state["last_step"] != env.common_step_counter:
         state["last_step"] = env.common_step_counter
-        ids = torch.as_tensor(env_ids, device=env.device)
-        lengths = env.episode_length_buf[ids].float()
-        n = len(lengths)
-        if n > 0:
-            idx = (state["ptr"] + torch.arange(n, device=env.device)) % env.num_envs
-            state["lengths"][idx] = lengths
-            state["ptr"] = int((state["ptr"] + n) % env.num_envs)
-            state["count"] = min(state["count"] + n, env.num_envs)
-        if state["opened_step"] is None and state["count"] > 0:
+        if env.common_step_counter > env.max_episode_length:
+            ids = torch.as_tensor(env_ids, device=env.device)
+            lengths = env.episode_length_buf[ids].float()
+            n = len(lengths)
+            if n > 0:
+                idx = (state["ptr"] + torch.arange(n, device=env.device)) % env.num_envs
+                state["lengths"][idx] = lengths
+                state["ptr"] = int((state["ptr"] + n) % env.num_envs)
+                state["count"] = min(state["count"] + n, env.num_envs)
+        if state["opened_step"] is None and state["count"] >= env.num_envs:
             mean_len = state["lengths"][: state["count"]].mean().item()
             if mean_len > ep_len_threshold:
                 state["opened_step"] = env.common_step_counter
