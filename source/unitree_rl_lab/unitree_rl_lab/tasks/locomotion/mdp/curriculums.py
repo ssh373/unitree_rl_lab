@@ -54,6 +54,18 @@ def lin_vel_cmd_levels(
     return torch.tensor(ranges.lin_vel_x[1], device=env.device)
 
 
+def ang_vel_z_cmd_range(env: ManagerBasedRLEnv, env_ids: Sequence[int]) -> torch.Tensor:
+    """Log-only term: the current upper bound of the ang_vel_z command range.
+
+    Changes nothing. ``lin_vel_cmd_levels`` logs only lin_vel_x, so this exposes the yaw range it
+    widens through ``ang_vel_delta`` as ``Curriculum/ang_vel_z_cmd_range``. Kept as a separate term
+    so the existing ``Curriculum/lin_vel_cmd_levels`` key stays comparable with older runs. List it
+    after ``lin_vel_cmd_levels`` in the CurriculumCfg so it reports the range of the same step.
+    """
+    ranges = env.command_manager.get_term("base_velocity").cfg.ranges
+    return torch.tensor(ranges.ang_vel_z[1], device=env.device)
+
+
 def ang_vel_cmd_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

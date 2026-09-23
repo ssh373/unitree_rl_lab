@@ -565,7 +565,12 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
+    # ang_vel_delta widens the yaw command on the same gate (0.4 -> 1.0 over 12 levels); without
+    # it the policy only ever trained on |yaw cmd| <= 0.4 while play/deploy hand it up to 1.0.
+    lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels, params={"ang_vel_delta": 0.05})
+    # Log-only: yaw range upper bound, logged as Curriculum/ang_vel_z_cmd_range. Must stay after
+    # lin_vel_cmd_levels so it reports the range widened in the same step.
+    ang_vel_z_cmd_range = CurrTerm(mdp.ang_vel_z_cmd_range)
 
 
 @configclass
