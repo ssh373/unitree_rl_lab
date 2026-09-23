@@ -166,18 +166,23 @@ def pace_energy_cost(
     k_el: dict[str, float],
     k_regen: float = 0.0,
     include_potential: bool = False,
+    speed_exponent: float = 2.0,
     command_name: str = "base_velocity",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """PACE energy reward, eq. 15-16: ``P_total / (|v_cmd|^2 + 1)`` in Watt.
+    """PACE energy reward, eq. 15-16: ``P_total / (|v_cmd|^p + 1)`` in Watt.
 
     The commanded speed sets the normalization, so the policy cannot lower the term by running
-    faster or slower than asked, and the ``+1`` keeps a standing command finite. Compared with
-    the CoT-style ``1/v`` this leans harder on high speed: at 2.5 m/s the factor is 0.14.
-    Weight it negative; the paper uses -16e-5 per Watt for ANYmal/Tytan.
+    faster or slower than asked, and the ``+1`` keeps a standing command finite. ``speed_exponent``
+    ``p`` is 2 in the paper, which makes the penalty nearly flat in speed on the G1 (P_total grows
+    ~4.5x from 0.5 to 2.5 m/s while the factor falls from 0.8 to 0.14), so the 2026-09-22 PACE run
+    beat the reward-shaping runs below 1.5 m/s and lost above. ``p = 1`` (1/(|v|+1): 0.67 at
+    0.5 m/s, 0.29 at 2.5 m/s) keeps the low-speed pressure and raises the high-speed one ~2.4x
+    at equal weight. Weight it negative; the paper uses -16e-5 per Watt for ANYmal/Tytan.
     """
     command = env.command_manager.get_command(command_name)
-    gamma = 1.0 / (torch.sum(torch.square(command[:, :2]), dim=-1) + 1.0)
+    speed = torch.linalg.norm(command[:, :2], dim=-1)
+    gamma = 1.0 / (torch.pow(speed, speed_exponent) + 1.0)
     return gamma * pace_total_power(env, k_el, k_regen, include_potential, asset_cfg)
 
 

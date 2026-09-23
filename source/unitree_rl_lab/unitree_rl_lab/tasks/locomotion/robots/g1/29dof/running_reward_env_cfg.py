@@ -186,17 +186,26 @@ their torque-speed-curve derivation and the 1/3 scale assumption are documented.
 1/tau_limit^2 weighting of joint_torque_normalized_l2 the hip:knee ratio is the same (1 : 0.4)
 but the small motors are weighted 6x and the wrists 28x less here.
 
-Weight: at 2 m/s the term is gamma * P_total = (1/5) * (386 + 140) W ~ 105, and -3.5e-3 makes it
-~ -0.37/s, the same ~10% of positive reward the other variants use at that speed. (The paper's
--16e-5 is on a different reward scale and would be ~1% here.) Gated on standing like the
-other variants: the 09-21 PACE run with the weight on from step 0 had not stood by 12k iterations.
+Weight and speed normalization (revised 2026-09-23 after the flat-ground eval of the 09-22 run,
+model_21800): with the paper's gamma = 1/(|v|^2+1) and -3.5e-3 the penalty was nearly flat in speed
+(~0.46/s at 0.5 m/s, ~0.38/s at 2 m/s, ~0.35/s at 2.5 m/s, from P_total ~160/540/720 W) while the
+reward-shaping run R3 pushed ~1.7x harder at 2 m/s. PACE won below 1.5 m/s (elec CoT -44% vs
+baseline at 0.5 m/s) and lost above (-13.5% vs R3 -17.3% at 2 m/s). Redistributed toward high
+speed instead of scaling the weight alone, since low speed was already trending toward a walk
+(flight ratio 0.27): gamma = 1/(|v|+1) (PACE_SPEED_EXPONENT = 1) and -5e-3 give ~0.53/s at 0.5,
+~0.90/s at 2.0 and ~1.03/s at 2.5 m/s -- about 1.15x / 2.4x / 2.9x the old pressure, still under
+30% of the ~3.6/s positive reward. (The paper's -16e-5 is on a different reward scale and would be
+~1% here.) Gated on standing like the other variants: the 09-21 PACE run with the weight on from
+step 0 had not stood by 12k iterations. Watch 2.5 m/s tracking error (0.053 m/s at 21800) and
+base height.
 """
 
 # k_el (with its 1/3 scale assumption) lives with the robot asset so the reward and the
 # energy/elec_* metrics use the same numbers.
 PACE_K_EL = UNITREE_G1_29DOF_K_EL
 PACE_K_REGEN = 0.0  # per-motor braking work recovered at this efficiency; 0 = dissipated (no regen path on the G1)
-PACE_ENERGY_WEIGHT = -3.5e-3  # per Watt (after gamma); ~10% of positive reward at 2 m/s
+PACE_SPEED_EXPONENT = 1.0  # gamma = 1 / (|v_cmd|^p + 1); paper p = 2 (used by the 09-22 run), 1 leans on high speed
+PACE_ENERGY_WEIGHT = -5e-3  # per Watt (after gamma); ~25% of positive reward at 2 m/s (was -3.5e-3 with p = 2)
 
 
 @configclass
@@ -206,7 +215,12 @@ class PaceRewardsCfg(BaseRewardsCfg):
     joint_energy_pace = RewTerm(
         func=mdp.pace_energy_cost,
         weight=0.0,
-        params={"k_el": PACE_K_EL, "k_regen": PACE_K_REGEN, "include_potential": False},
+        params={
+            "k_el": PACE_K_EL,
+            "k_regen": PACE_K_REGEN,
+            "include_potential": False,
+            "speed_exponent": PACE_SPEED_EXPONENT,
+        },
     )
 
 
