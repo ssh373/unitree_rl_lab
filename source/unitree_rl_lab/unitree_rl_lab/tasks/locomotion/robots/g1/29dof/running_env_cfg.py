@@ -396,7 +396,7 @@ class RewardsCfg:
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp,
         weight=2.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+        params={"command_name": "base_velocity", "std": math.sqrt(0.04)},
     )
 
     alive = RewTerm(func=mdp.is_alive, weight=0.15)

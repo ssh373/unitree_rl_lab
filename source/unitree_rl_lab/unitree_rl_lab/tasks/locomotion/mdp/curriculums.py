@@ -12,7 +12,17 @@ def lin_vel_cmd_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     reward_term_name: str = "track_lin_vel_xy",
+    ang_vel_delta: float = 0.0,
 ) -> torch.Tensor:
+    """Widen the velocity command ranges once ``reward_term_name`` clears 80% of its weight.
+
+    Every level moves lin_vel_x and lin_vel_y by 0.1 toward their limit_ranges. With
+    ``ang_vel_delta`` > 0 the same gate also moves ang_vel_z by that amount, so the yaw range
+    grows on the lin-vel gate instead of on its own tracking reward (the yaw reward on the
+    running task plateaus well under 80% and would never open its own gate, see
+    ``ang_vel_cmd_levels``). 0.05 takes the running task's yaw range from 0.4 to 1.0 in 12 of
+    the 21 levels lin_vel_x needs. Default 0.0 keeps ang_vel_z fixed (velocity task behaviour).
+    """
     command_term = env.command_manager.get_term("base_velocity")
     ranges = command_term.cfg.ranges
     limit_ranges = command_term.cfg.limit_ranges
@@ -33,6 +43,13 @@ def lin_vel_cmd_levels(
                 limit_ranges.lin_vel_y[0],
                 limit_ranges.lin_vel_y[1],
             ).tolist()
+            if ang_vel_delta > 0.0:
+                delta_ang = torch.tensor([-ang_vel_delta, ang_vel_delta], device=env.device)
+                ranges.ang_vel_z = torch.clamp(
+                    torch.tensor(ranges.ang_vel_z, device=env.device) + delta_ang,
+                    limit_ranges.ang_vel_z[0],
+                    limit_ranges.ang_vel_z[1],
+                ).tolist()
 
     return torch.tensor(ranges.lin_vel_x[1], device=env.device)
 

@@ -70,7 +70,7 @@ FSM:
       Mimic_Dance_102: LT(2s) + down.on_pressed
       Mimic_Gangnam_Style: LT(2s) + left.on_pressed
 
-    policy_dir: /home/kist/unitree_rl_lab/logs/rsl_rl/unitree_g1_29dof_running/2026-09-15_10-44-43_baseline
+    policy_dir: /home/kist/unitree_rl_lab/logs/rsl_rl/unitree_g1_29dof_running/2026-09-22_19-17-11
     # policy_dir: ../../../logs/rsl_rl/unitree_g1_29dof_velocity
 
     # Replica of the sim2real CheckSafetyLimits kill, so the simulated robot drops into Passive
