@@ -20,10 +20,25 @@ run (``2026-09-21_10-56-46``) found the cheapest way around ``short_contact``: h
 feet at once -- symmetric, never single-stance, hence never at risk of falling -- while the
 speed-matched reference at 0.15 m/s (people standing about) raised no objection.
 
-The rest -- scene, events, commands, actions, the other policy/critic terms, the remaining 19
+Posture terms removed as well (decision 2026-09-23, after a probe of the discriminator features):
+``joint_deviation_legs`` (hip roll/yaw, -1.0), ``joint_deviation_arm_lateral`` (-0.5),
+``joint_deviation_waists`` (-1.0) and ``flat_orientation_l2`` (-2.0) are dropped, and
+``base_height`` is relaxed from -10 back to the pre-09-15 -2. On the baseline policy the reference
+differs from the policy on exactly the joints these terms pin: hip roll/yaw amplitude x11-25,
+knee x2.5-2.8, shoulder yaw / waist pitch / torso lean frozen at default (std ~0.01 rad) against
+0.1-0.4 rad in the reference. A linear probe separated the two sides at 100% on those features
+alone, the discriminator saturated within 50 iterations in every AMP run (acc 1.0, d_policy -0.9),
+and the policy could not move toward the reference without paying these penalties -- so the style
+reward degenerated into a constant alive bonus (standing still / hopping) or, at low weight, the
+partial compliance dragged tracking under the curriculum gate. These terms are hand-crafted style,
+which is what AMP is here to replace. Safety and effort terms stay: ``dof_pos_limits``,
+``undesired_contacts``, ``action_rate``, ``joint_acc``, ``joint_vel``, ``feet_slide``, and the
+actuator effort limits in the robot asset are untouched (user requirement).
+
+The rest -- scene, events, commands, actions, the other policy/critic terms, the remaining
 reward terms, terminations and curriculum -- is inherited unchanged. The comparison this arm
-supports is therefore "baseline with its hand-crafted gait terms replaced by AMP", not
-"baseline plus AMP".
+supports is therefore "baseline with its hand-crafted gait and posture terms replaced by AMP",
+not "baseline plus AMP".
 
 The environment side of AMP itself is only the discriminator observation group
 (``mdp.amp_observations.AmpObsCfg``); the discriminator, the style reward and the reference
@@ -75,10 +90,22 @@ class ObservationsCfg(BaseObservationsCfg):
 
 @configclass
 class RewardsCfg(BaseRewardsCfg):
-    """Baseline rewards without the two clock-driven gait terms, plus one clock-free stepping term."""
+    """Baseline rewards without the clock-driven gait terms and the hand-crafted posture terms, plus one
+    clock-free stepping term. See the module docstring for the evidence behind each removal."""
 
     run_contact_pattern = None
     push_off = None
+
+    # Posture / stride shape is the discriminator's job in this arm (2026-09-23). Effort limits and
+    # joint position limits are NOT relaxed anywhere.
+    joint_deviation_legs = None  # hip roll/yaw: reference uses +-0.2 rad, policy was pinned at 0.01
+    joint_deviation_arm_lateral = None  # shoulder roll/yaw
+    joint_deviation_waists = None  # waist yaw/roll/pitch
+    flat_orientation_l2 = None  # reference leans 4 deg +- 10 deg; the -2.0 term held the torso at 0.3 deg
+    # Knee flexion: the -10 weight (set 2026-09-15) straightened the knee (std 0.16 rad vs 0.45 in the
+    # reference). Back to the pre-09-15 -2 so the base may bob with a human stride; not removed, so the
+    # policy cannot run in a crouch to cheat short_contact / feet_air_time.
+    base_height = RewTerm(func=mdp.base_height_l2, weight=-2.0, params={"target_height": 0.78})
 
     # Alternating single stance, no clock. Isaac Lab's G1 walking config uses weight 0.25 with a
     # 0.4 s cap; running stances are ~0.25 s and this term has to beat the two-footed hop, so the
@@ -106,7 +133,7 @@ class RewardsCfg(BaseRewardsCfg):
 # Lower bound back at the baseline's -0.4 (2026-09-22): the (0.8, 1.2) run stood only because the
 # then-oversized style reward paid for standing still; with the style term in task units the slow
 # commands are what let the policy learn balance first (the 0.4-start runs stood at iter 200-800).
-AMP_START_LIN_VEL_X = (-0.4, 1.2)
+AMP_START_LIN_VEL_X = (0.5, 1.2)
 
 
 @configclass

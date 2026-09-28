@@ -85,6 +85,75 @@ REGISTER_OBSERVATION(keyboard_velocity_commands)
     return cmd;
 }
 
+// Straight-line heading hold for long runs (2026-09-28). Same keys as keyboard_velocity_commands for
+// vx (w/s) and vy (a/d, for manual lane correction), but the yaw-rate command is closed-loop:
+//     wz = clamp(kp * wrap(yaw_ref - yaw), -YAW_MAX, YAW_MAX)
+// with yaw from the IMU quaternion. The reference is captured on the first call (policy start) and
+// re-captured with 'h'; 'g' releases it (wz = 0, plain open loop); space zeroes vx/vy but keeps the
+// hold. The policy drifts 0.01-0.03 rad/s at wz = 0 even in Isaac, which is several full turns
+// over 30 min, so an open-loop yaw command cannot keep a heading. deploy.yaml params (optional):
+//   heading_kp (default 1.0; Isaac Lab's heading_control_stiffness is 0.5), vx0 (initial vx, default 0).
+// Change the "velocity_commands" observation name in deploy.yaml to "heading_hold_velocity_commands".
+REGISTER_OBSERVATION(heading_hold_velocity_commands)
+{
+    std::string key = FSMState::keyboard->key();
+    static std::vector<float> cmd = {0.0f, 0.0f, 0.0f};
+    static std::string last_key = "";
+    static bool armed = false;
+    static float yaw_ref = 0.0f;
+    static int tick = 0;
+    static int64_t last_call_ms = 0;
+
+    constexpr float VX_STEP = 0.1f, VY_STEP = 0.1f;
+    constexpr float VX_MAX = 2.0f, VX_MIN = -1.0f, VY_MAX = 0.5f, VY_MIN = -0.5f, YAW_MAX = 0.5f;
+
+    float kp = 1.0f;
+    try { kp = params["heading_kp"].as<float>(); } catch(const std::exception&) {}
+
+    const auto & q = env->robot->data.root_quat_w;  // IMU orientation, world frame
+    const float yaw = std::atan2(2.0f * (q.w() * q.z() + q.x() * q.y()),
+                                 1.0f - 2.0f * (q.y() * q.y() + q.z() * q.z()));
+
+    // Observations are computed once at construction and then only while this state runs, so a gap
+    // in calls marks a (re)entry into the RL state: capture the heading there, not at program start.
+    const int64_t now_ms = unitree::common::GetCurrentTimeMillisecond();
+    if (now_ms - last_call_ms > 500)
+    {
+        armed = true; yaw_ref = yaw; cmd = {0.0f, 0.0f, 0.0f};
+        try { cmd[0] = std::clamp(params["vx0"].as<float>(), VX_MIN, VX_MAX); } catch(const std::exception&) {}
+        spdlog::info("[heading-hold] armed at yaw {:.3f} rad, kp {:.2f}, vx {:.2f} (h: re-arm, g: release)", yaw_ref, kp, cmd[0]);
+    }
+    last_call_ms = now_ms;
+
+    if (!key.empty() && key != last_key)
+    {
+        if      (key == "w") cmd[0] += VX_STEP;
+        else if (key == "s") cmd[0] -= VX_STEP;
+        else if (key == "a") cmd[1] += VY_STEP;
+        else if (key == "d") cmd[1] -= VY_STEP;
+        else if (key == " ") { cmd[0] = 0.0f; cmd[1] = 0.0f; }
+        else if (key == "h") { yaw_ref = yaw; armed = true; spdlog::info("[heading-hold] re-armed at yaw {:.3f} rad", yaw_ref); }
+        else if (key == "g") { armed = false; spdlog::info("[heading-hold] released"); }
+        cmd[0] = std::clamp(cmd[0], VX_MIN, VX_MAX);
+        cmd[1] = std::clamp(cmd[1], VY_MIN, VY_MAX);
+        spdlog::info("Command | vx: {:.2f} m/s | vy: {:.2f} m/s | heading hold: {}", cmd[0], cmd[1], armed ? "on" : "off");
+    }
+    last_key = key;
+
+    float err = yaw_ref - yaw;
+    err = std::atan2(std::sin(err), std::cos(err));  // wrap to [-pi, pi]
+    cmd[2] = armed ? std::clamp(kp * err, -YAW_MAX, YAW_MAX) : 0.0f;
+
+    if (++tick % 250 == 0)  // policy runs at 50 Hz -> every 5 s
+    {
+        spdlog::info("[heading-hold] yaw {:.3f} ref {:.3f} err {:+.3f} rad ({:+.1f} deg) | wz cmd {:+.3f} actual {:+.3f} rad/s",
+                     yaw, yaw_ref, err, err * 57.2958f, cmd[2], env->robot->data.root_ang_vel_b[2]);
+    }
+
+    env->robot->data.velocity_command_b << cmd[0], cmd[1], cmd[2];
+    return cmd;
+}
+
 }
 
 State_RLBase::State_RLBase(int state_mode, std::string state_string)
@@ -227,36 +296,60 @@ bool State_RLBase::motor_limits_exceeded()
     return false;
 }
 
+void State_RLBase::sample_velocity()
+{
+    const auto & q = env->robot->data.root_quat_w;
+    const double yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
+                                  1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+    if (!yaw_init_) { yaw_prev_ = yaw; yaw_unwrapped_ = yaw; yaw_init_ = true; }
+    double d = yaw - yaw_prev_;
+    d = std::atan2(std::sin(d), std::cos(d));  // wrap the increment, accumulate unwrapped
+    yaw_unwrapped_ += d; yaw_prev_ = yaw;
+
+    VelSample sm{ (double)unitree::common::GetCurrentTimeMillisecond() * 1e-3, yaw_unwrapped_, 0.0f, 0.0f, false };
+    if (!highstate->isTimeout())
+    {
+        std::lock_guard<std::mutex> lock(highstate->mutex_);
+        const Eigen::Vector3f v = highstate->velocity();
+        sm.vx_w = v[0]; sm.vy_w = v[1]; sm.has_lin = true;
+    }
+    vel_hist_.push_back(sm);
+    const size_t window = std::max<size_t>(2, (size_t)std::lround(1.0 / env->step_dt));
+    while (vel_hist_.size() > window) vel_hist_.pop_front();
+}
+
 void State_RLBase::log_velocity()
 {
     const auto command = env->robot->data.velocity_command_b;
-    const float actual_yaw_rate = env->robot->data.root_ang_vel_b[2];
+    const float gyro_z = env->robot->data.root_ang_vel_b[2];  // pelvis-frame instant, for reference only
 
-    if (highstate->isTimeout())
+    if (vel_hist_.size() < 2)
     {
-        spdlog::info(
-            "Velocity | command: vx={:.2f}, vy={:.2f}, yaw={:.2f} | "
-            "actual: vx=N/A, vy=N/A, yaw={:.2f}",
-            command[0], command[1], command[2], actual_yaw_rate
-        );
+        spdlog::info("Velocity | command: vx={:.2f}, vy={:.2f}, yaw={:.2f} | actual: (collecting)", command[0], command[1], command[2]);
         return;
     }
+    const auto & a = vel_hist_.front(); const auto & b = vel_hist_.back();
+    const double dt = b.t - a.t;
+    const double heading_rate = dt > 1e-3 ? (b.yaw - a.yaw) / dt : 0.0;
 
-    Eigen::Vector3f actual_linear_velocity_w;
+    // Mean world velocity over the window, expressed in the heading frame (yaw only, no roll/pitch):
+    // this is the "robot" forward/lateral speed the command refers to.
+    double sx = 0.0, sy = 0.0, syaw = 0.0; int n = 0;
+    for (const auto & s : vel_hist_) { if (s.has_lin) { sx += s.vx_w; sy += s.vy_w; syaw += s.yaw; ++n; } }
+    if (n == 0)
     {
-        std::lock_guard<std::mutex> lock(highstate->mutex_);
-        actual_linear_velocity_w = highstate->velocity();
+        spdlog::info("Velocity | command: vx={:.2f}, vy={:.2f}, yaw={:.2f} | actual (1 s avg): vx=N/A, vy=N/A, "
+                     "heading rate={:+.3f} rad/s | pelvis gyro z={:+.2f}",
+                     command[0], command[1], command[2], heading_rate, gyro_z);
+        return;
     }
+    const double mx = sx / n, my = sy / n, myaw = syaw / n;
+    const double vx_h =  std::cos(myaw) * mx + std::sin(myaw) * my;
+    const double vy_h = -std::sin(myaw) * mx + std::cos(myaw) * my;
 
-    const Eigen::Vector3f actual_linear_velocity_b =
-        env->robot->data.root_quat_w.conjugate() * actual_linear_velocity_w;
-
-    spdlog::info(
-        "Velocity | command: vx={:.2f}, vy={:.2f}, yaw={:.2f} | "
-        "actual: vx={:.2f}, vy={:.2f}, yaw={:.2f}",
-        command[0], command[1], command[2],
-        actual_linear_velocity_b[0], actual_linear_velocity_b[1], actual_yaw_rate
-    );
+    spdlog::info("Velocity | command: vx={:.2f}, vy={:.2f}, yaw={:.2f} | actual (1 s avg): vx={:.2f}, vy={:.2f}, "
+                 "heading rate={:+.3f} rad/s | pelvis gyro z={:+.2f}",
+                 command[0], command[1], command[2], vx_h, vy_h, heading_rate, gyro_z);
 }
 
 void State_RLBase::open_logger()

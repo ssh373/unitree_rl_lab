@@ -49,9 +49,17 @@ from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 # At 2 m/s: power ~1.07 x 0.25 = -0.27, torque 1.45 x 0.35 = -0.51, total ~ -0.78, about 22% of
 # the ~3.6 of positive reward (was ~10% at -0.20/-0.10 on gross power). Watch base_height and
 # knee angle: a torque weight this high is untested and may straighten the knee.
+#
+# x2 control run (user decision 2026-09-28): both weights doubled from -0.25/-0.35 (R3) to
+# -0.5/-0.7 to match the leg-joint pressure of the PACEedit run (p = 1, -5e-3), which per Watt of
+# mechanical power and per Nm^2 on the hip/knee motors is 2.0-2.3x R3 at 2 m/s. PACEedit reached
+# elec CoT -36% vs baseline at 2 m/s against R3's -17% with a training-average penalty only 1.4x
+# larger (0.92/s vs 0.67/s); this run separates "more pressure" from "PACE's per-motor k_el and
+# speed weighting" as the cause. Expected penalty ~1.3-1.5/s, about 35-40% of positive reward.
+# The small motors stay at R3's weighting (3x PACEedit on ankle/arm, 12x on the wrists).
 ENERGY_POWER_REF_W = 300.0
-ENERGY_POWER_WEIGHT = -0.25
-ENERGY_TORQUE_WEIGHT = -0.35
+ENERGY_POWER_WEIGHT = -0.5  # was -0.25 (R3)
+ENERGY_TORQUE_WEIGHT = -0.7  # was -0.35 (R3)
 STAND_EP_LEN = 500.0  # steps; half the 1000-step episode. Falling runs sit at 50-130.
 STAND_RAMP_ITERS = 500
 

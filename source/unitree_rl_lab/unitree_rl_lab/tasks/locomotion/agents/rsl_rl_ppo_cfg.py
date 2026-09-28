@@ -177,5 +177,7 @@ class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
             use_mirror_loss=False,
             data_augmentation_func=compute_g1_29dof_symmetric_states,
         ),
-        amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_CLIPS),
+        # Single clip (user decision 2026-09-23): run1_subject5, the cleanest take. Low-speed coverage is
+        # thin (5% below 0.6 m/s), so speed-matched sampling falls back to nearest neighbours there.
+        amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_SINGLE_CLIP),
     )

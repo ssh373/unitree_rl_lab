@@ -2,6 +2,8 @@
 // All rights reserved.
 
 #pragma once
+#include <deque>
+#include <cmath>
 
 #include "FSMState.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
@@ -46,6 +48,7 @@ public:
             while (policy_thread_running)
             {
                 env->step();
+                sample_velocity();  // 1 s window for the robot-frame velocity log
 
                 const long velocity_log_interval = std::max(
                     1L, static_cast<long>(std::lround(0.5 / env->step_dt))
@@ -75,7 +78,16 @@ public:
 
 private:
     void log_velocity();
+    void sample_velocity();
     void open_logger();
+    // Robot-frame velocity readout for the periodic log: heading (yaw from the IMU quaternion,
+    // unwrapped) and the world-frame base velocity, sampled every policy step and averaged over
+    // the last second. The old readout printed the pelvis-frame gyro z of one instant, which in a
+    // running gait is dominated by the stride oscillation and does not measure the turn rate.
+    struct VelSample { double t; double yaw; float vx_w; float vy_w; bool has_lin; };
+    std::deque<VelSample> vel_hist_;
+    double yaw_unwrapped_ = 0.0, yaw_prev_ = 0.0;
+    bool yaw_init_ = false;
 
     // Replica of the sim2real CheckSafetyLimits kill (g1_sim2real/wholebody_rl.hpp), so the
     // simulated robot collapses into Passive exactly where the real one would. Thresholds come
