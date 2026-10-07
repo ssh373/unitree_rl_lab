@@ -565,11 +565,8 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    # ang_vel_delta widens the yaw command on the same gate (0.4 -> 1.0 over 12 levels); without
-    # it the policy only ever trained on |yaw cmd| <= 0.4 while play/deploy hand it up to 1.0.
     lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels, params={"ang_vel_delta": 0.05})
-    # Log-only: yaw range upper bound, logged as Curriculum/ang_vel_z_cmd_range. Must stay after
-    # lin_vel_cmd_levels so it reports the range widened in the same step.
+
     ang_vel_z_cmd_range = CurrTerm(mdp.ang_vel_z_cmd_range)
 
 
@@ -622,8 +619,6 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         self.scene.num_envs = 32
         self.scene.terrain.terrain_generator.num_rows = 2
         self.scene.terrain.terrain_generator.num_cols = 10
-        # Keep play deterministic enough for visual evaluation. Startup dynamics
-        # randomization remains enabled, but observation/action noise and pushes do not.
         self.observations.policy.enable_corruption = False
         self.actions.JointPositionAction.min_delay = 0
         self.actions.JointPositionAction.max_delay = 0

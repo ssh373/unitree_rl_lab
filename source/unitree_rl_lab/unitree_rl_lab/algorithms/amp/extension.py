@@ -55,6 +55,7 @@ class AMPExtension(PPOExtension):
         *,
         obs_group: str = "amp",
         speed_range: tuple[float, float] = (0.2, 2.5),
+        clip_speed_ranges: list[tuple[float, float] | None] | None = None,
         speed_matched_sampling: bool = True,
         speed_match_window: float = 0.1,
         reward_weight: float = 2.0,
@@ -79,6 +80,8 @@ class AMPExtension(PPOExtension):
             motion_files: Reference motion npz files (see :mod:`unitree_rl_lab.algorithms.amp.data`).
             obs_group: Name of the observation group holding the transition pair.
             speed_range: Planar-speed gate applied to the reference transitions.
+            clip_speed_ranges: Optional per-clip gate, one ``(lo, hi)`` per motion file, overriding
+                ``speed_range`` for that clip (see :class:`AmpMotionData`).
             speed_matched_sampling: Draw each reference transition for discriminator training at the
                 speed of the policy transition it is paired with (see
                 :meth:`AmpMotionData.sample_matched`), so speed itself is not a discriminative cue.
@@ -113,7 +116,9 @@ class AMPExtension(PPOExtension):
         self._env = _env
         self._symmetry_fn = None
 
-        self.data = AmpMotionData(motion_files, speed_range=speed_range, device=device)
+        self.data = AmpMotionData(
+            motion_files, speed_range=speed_range, device=device, clip_speed_ranges=clip_speed_ranges
+        )
         # Built in _lazy_prepare once the observation width is known.
         self.discriminator: AmpDiscriminator | None = None
         self._disc_kwargs = dict(

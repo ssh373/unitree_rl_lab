@@ -1,55 +1,3 @@
-"""Running task with the hand-crafted gait clock replaced by an AMP style reward.
-
-Ablation B of the energy-efficiency study. The baseline (``running_env_cfg.py``) drives its
-running gait with a wall-clock phase: ``gait_phase`` (sin/cos of the clock) in the policy and
-critic observations, and two rewards computed from the same clock -- ``run_contact_pattern``
-(exact match of the expected single-support/flight contact state) and ``push_off`` (upward base
-velocity in late stance). Here the clock is removed on both sides and the gait's rhythm, phase
-and flight are left to the AMP style reward learned from human running motions (decision
-2026-09-21). The two clock rewards go with it: without the phase in the observation the policy
-cannot lock onto the clock, so an exact-match reward would be noise. ``short_contact`` stays --
-it penalises stances longer than the running stance target without reading the clock, so it
-keeps the gait a run at every speed while AMP decides what the run looks like.
-
-One clock-free stepping reward is added in their place: ``feet_air_time_positive_biped`` (the
-term Isaac Lab's own G1/H1/Digit/Cassie locomotion configs use). It pays only while exactly one
-foot is on the ground, for the shorter of the swing foot's air time and the stance foot's
-contact time, capped at ``threshold``. Double support and flight both score zero, so it says
-"alternate your feet" without saying when or how fast. It is there because the first clock-free
-run (``2026-09-21_10-56-46``) found the cheapest way around ``short_contact``: hopping on both
-feet at once -- symmetric, never single-stance, hence never at risk of falling -- while the
-speed-matched reference at 0.15 m/s (people standing about) raised no objection.
-
-Posture terms removed as well (decision 2026-09-23, after a probe of the discriminator features):
-``joint_deviation_legs`` (hip roll/yaw, -1.0), ``joint_deviation_arm_lateral`` (-0.5),
-``joint_deviation_waists`` (-1.0) and ``flat_orientation_l2`` (-2.0) are dropped, and
-``base_height`` is relaxed from -10 back to the pre-09-15 -2. On the baseline policy the reference
-differs from the policy on exactly the joints these terms pin: hip roll/yaw amplitude x11-25,
-knee x2.5-2.8, shoulder yaw / waist pitch / torso lean frozen at default (std ~0.01 rad) against
-0.1-0.4 rad in the reference. A linear probe separated the two sides at 100% on those features
-alone, the discriminator saturated within 50 iterations in every AMP run (acc 1.0, d_policy -0.9),
-and the policy could not move toward the reference without paying these penalties -- so the style
-reward degenerated into a constant alive bonus (standing still / hopping) or, at low weight, the
-partial compliance dragged tracking under the curriculum gate. These terms are hand-crafted style,
-which is what AMP is here to replace. Safety and effort terms stay: ``dof_pos_limits``,
-``undesired_contacts``, ``action_rate``, ``joint_acc``, ``joint_vel``, ``feet_slide``, and the
-actuator effort limits in the robot asset are untouched (user requirement).
-
-The rest -- scene, events, commands, actions, the other policy/critic terms, the remaining
-reward terms, terminations and curriculum -- is inherited unchanged. The comparison this arm
-supports is therefore "baseline with its hand-crafted gait and posture terms replaced by AMP",
-not "baseline plus AMP".
-
-The environment side of AMP itself is only the discriminator observation group
-(``mdp.amp_observations.AmpObsCfg``); the discriminator, the style reward and the reference
-motion buffer live in the algorithm layer (``unitree_rl_lab.algorithms``) and are selected
-through the agent configuration. The ``amp`` group is kept in the rollout buffer for the
-discriminator and never reaches the actor or critic.
-
-Deployment: the policy input is 10 narrower than the baseline's (no ``gait_phase`` x history 5),
-so a policy trained here needs the ``deploy.yaml`` exported from its own run, and the gait-clock
-masking in the deploy stack does not apply to it.
-"""
 
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
@@ -63,6 +11,16 @@ from .running_env_cfg import ObservationsCfg as BaseObservationsCfg
 from .running_env_cfg import RewardsCfg as BaseRewardsCfg
 from .running_env_cfg import RobotEnvCfg as BaseRobotEnvCfg
 from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
+
+from .running_env_cfg import CurriculumCfg as BaseCurriculumCfg
+from .running_reward_env_cfg import (
+    PACE_ENERGY_WEIGHT,
+    PACE_K_EL,
+    PACE_K_REGEN,
+    PACE_SPEED_EXPONENT,
+    _gate,
+)
+
 
 
 @configclass
@@ -99,9 +57,19 @@ class RewardsCfg(BaseRewardsCfg):
     # Posture / stride shape is the discriminator's job in this arm (2026-09-23). Effort limits and
     # joint position limits are NOT relaxed anywhere.
     joint_deviation_legs = None  # hip roll/yaw: reference uses +-0.2 rad, policy was pinned at 0.01
-    joint_deviation_arm_lateral = None  # shoulder roll/yaw
+    joint_deviation_arm_lateral = None  # shoulder roll/yaw (and, in the base cfg, the wrists -- see below)
     joint_deviation_waists = None  # waist yaw/roll/pitch
     flat_orientation_l2 = None  # reference leans 4 deg +- 10 deg; the -2.0 term held the torso at 0.3 deg
+
+    # Wrists only (2026-10-07): arm_lateral was the one term holding the six wrist joints, and without it
+    # the AMP policies shake the wrists -- the retargeted reference wrists are IK noise (pos std 0.14-0.58
+    # rad, left/right asymmetric) that the discriminator rewards and the 5 Nm W4010 motors chase. Same
+    # weight and kernel as the base term; shoulder roll/yaw stay free for the discriminator.
+    joint_deviation_wrist = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
+    )
     # Knee flexion: the -10 weight (set 2026-09-15) straightened the knee (std 0.16 rad vs 0.45 in the
     # reference). Back to the pre-09-15 -2 so the base may bob with a human stride; not removed, so the
     # policy cannot run in a crouch to cheat short_contact / feet_air_time.
@@ -120,6 +88,26 @@ class RewardsCfg(BaseRewardsCfg):
             "threshold": 0.3,
         },
     )
+
+    # TEMP: PACE power cost on the AMP arm. Disabled 2026-10-02 (user request) for a pure-AMP run with the
+    # speed-banded walk/run reference set; uncomment this term AND the CurriculumCfg / curriculum lines
+    # below to re-enable.
+    # joint_energy_pace = RewTerm(
+    #     func=mdp.pace_energy_cost,
+    #     weight=0.0,
+    #     params={
+    #         "k_el": PACE_K_EL,
+    #         "k_regen": PACE_K_REGEN,
+    #         "include_potential": False,
+    #         "speed_exponent": PACE_SPEED_EXPONENT,
+    #     },
+    # )
+
+
+# PACE standing gate -- disabled together with joint_energy_pace above (2026-10-02).
+# @configclass
+# class CurriculumCfg(BaseCurriculumCfg):
+#     joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
 
 
 # Where the velocity curriculum starts. The baseline starts at (-0.4, 0.4); the AMP arm starts
@@ -140,6 +128,7 @@ AMP_START_LIN_VEL_X = (0.5, 1.2)
 class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
+    # curriculum: CurriculumCfg = CurriculumCfg()      # PACE gate, disabled 2026-10-02 (see above)
 
     def __post_init__(self):
         super().__post_init__()

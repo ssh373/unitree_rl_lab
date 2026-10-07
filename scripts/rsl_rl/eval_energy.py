@@ -24,6 +24,12 @@ Reported per speed (ten columns, the analysis set agreed on 2026-09-21):
                          cheaper by dropping the flight phase shows up here
     survival             fraction of envs that never terminated during the window
 
+With --per_group, each speed is also broken down by joint group (hip, knee, ankle, waist,
+shoulder, elbow, wrist): positive mechanical power, Joule heat, raw sum tau^2, each group's share
+of the whole-body total, and the mean |q - q_default| of the group. The groups sum exactly to the
+whole-body columns above. This separates savings made in the legs from savings made by holding
+the arms differently. Written to <out>_groups.csv next to --out.
+
 Braking work is not counted anywhere: the G1 has no regenerative path, so negative tau * qdot is
 assumed dissipated, the same convention as the joint_power reward terms.
 
@@ -62,6 +68,12 @@ parser.add_argument(
 )
 parser.add_argument("--out", type=str, default=None, help="Optional CSV path for the result table.")
 parser.add_argument(
+    "--per_group",
+    action="store_true",
+    default=False,
+    help="Also report energy per joint group (legs, waist, arms, wrists); written to <out>_groups.csv.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 cli_args.add_rsl_rl_args(parser)
@@ -75,6 +87,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
+import re
 import torch
 
 
@@ -90,6 +103,32 @@ from unitree_rl_lab.algorithms.registry import get_runner_class
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 GRAVITY = 9.81
+
+# Joint groups for --per_group, tried in order; first match wins. Every joint must land in one
+# group so the groups add up to the whole-body totals.
+JOINT_GROUPS = {
+    "hip": r"hip_",
+    "knee": r"knee",
+    "ankle": r"ankle",
+    "waist": r"waist",
+    "shoulder": r"shoulder",
+    "elbow": r"elbow",
+    "wrist": r"wrist",
+}
+
+
+def _joint_group_matrix(joint_names: list[str], device) -> tuple[list[str], torch.Tensor]:
+    """One-hot (num_joints, num_groups) matrix; a joint outside every group raises."""
+    names = list(JOINT_GROUPS)
+    mat = torch.zeros(len(joint_names), len(names), device=device)
+    for j, joint in enumerate(joint_names):
+        for g, pattern in enumerate(JOINT_GROUPS.values()):
+            if re.search(pattern, joint):
+                mat[j, g] = 1.0
+                break
+        else:
+            raise KeyError(f"joint '{joint}' matches no group in JOINT_GROUPS")
+    return names, mat
 
 
 def _freeze_env_cfg(env_cfg, terrain: str):
@@ -158,6 +197,11 @@ def main():
     contact_sensor = base_env.scene.sensors[cmd_cfg.contact_sensor_name]
     feet_ids, _ = contact_sensor.find_bodies(cmd_cfg.feet_body_names, preserve_order=True)
 
+    group_names, group_mat = _joint_group_matrix(robot.joint_names, device)
+    joints_per_group = group_mat.sum(dim=0)
+    num_groups = len(group_names)
+    group_rows = []
+
     window = args_cli.warmup_steps + args_cli.measure_steps
     max_steps = int(base_env.max_episode_length)
     if window > max_steps:
@@ -182,6 +226,10 @@ def main():
         track_err_sum = torch.zeros(num_envs, device=device)
         flight_sum = torch.zeros(num_envs, device=device)
         valid = torch.ones(num_envs, dtype=torch.bool, device=device)
+        group_pos_j = torch.zeros(num_envs, num_groups, device=device)
+        group_joule_j = torch.zeros(num_envs, num_groups, device=device)
+        group_tau_sq_dt = torch.zeros(num_envs, num_groups, device=device)
+        group_dev_sum = torch.zeros(num_envs, num_groups, device=device)
 
         # The reset has to happen inside inference mode: the runner already produced
         # inference tensors, and writing root poses to them from normal mode raises.
@@ -216,6 +264,14 @@ def main():
                 track_err_sum += torch.linalg.norm(command_xy - robot.data.root_lin_vel_b[:, :2], dim=-1)
                 flight_sum += (~is_contact).all(dim=1).float()
 
+                if args_cli.per_group:
+                    tau_sq = torch.square(torque)
+                    group_pos_j += (torch.clamp_min(torque * robot.data.joint_vel, 0.0) @ group_mat) * dt
+                    group_joule_j += ((tau_sq * k_el) @ group_mat) * dt
+                    group_tau_sq_dt += (tau_sq @ group_mat) * dt
+                    joint_dev = torch.abs(robot.data.joint_pos - robot.data.default_joint_pos)
+                    group_dev_sum += (joint_dev @ group_mat) / joints_per_group
+
         n = float(args_cli.measure_steps)
         survival = valid.float().mean().item()
         if valid.sum() == 0:
@@ -246,6 +302,35 @@ def main():
             f"err {row['track_err']:4.2f} | flight {row['flight_ratio']:.2f} | alive {row['survival']:.2f}"
         )
 
+        if args_cli.per_group:
+            total_pos = m(pos_energy_j)
+            total_joule = m(joule_j)
+            total_tau_sq = m(torque_sq_raw_dt)
+            print(f"  {'group':9s} {'P+ [W]':>8s} {'P+ %':>6s} {'Joule [W]':>9s} {'tau^2':>8s} {'tau^2 %':>7s} "
+                  f"{'elec %':>6s} {'|dq0| rad':>9s}")
+            for g, group in enumerate(group_names):
+                g_pos = m(group_pos_j[:, g])
+                g_joule = m(group_joule_j[:, g])
+                g_tau_sq = m(group_tau_sq_dt[:, g])
+                g_row = {
+                    "cmd_mps": speed,
+                    "group": group,
+                    "n_joints": int(joints_per_group[g].item()),
+                    "pos_power_w": g_pos / (n * dt),
+                    "pos_power_share": g_pos / max(total_pos, 1e-9),
+                    "joule_w": g_joule / (n * dt),
+                    "torque_sq_raw": g_tau_sq / (n * dt),
+                    "torque_sq_share": g_tau_sq / max(total_tau_sq, 1e-9),
+                    "elec_share": (g_pos + g_joule) / max(total_pos + total_joule, 1e-9),
+                    "mean_abs_dev_rad": m(group_dev_sum[:, g]) / n,
+                }
+                group_rows.append(g_row)
+                print(
+                    f"  {group:9s} {g_row['pos_power_w']:8.1f} {100 * g_row['pos_power_share']:5.1f}% "
+                    f"{g_row['joule_w']:9.1f} {g_row['torque_sq_raw']:8.0f} {100 * g_row['torque_sq_share']:6.1f}% "
+                    f"{100 * g_row['elec_share']:5.1f}% {g_row['mean_abs_dev_rad']:9.3f}"
+                )
+
     if rows:
         print("\n=== summary ===")
         header = list(rows[0].keys())
@@ -259,6 +344,15 @@ def main():
                 for row in rows:
                     f.write(",".join(f"{row[k]:.6f}" for k in header) + "\n")
             print(f"\n[INFO] wrote {args_cli.out}")
+
+    if group_rows and args_cli.out:
+        group_path = os.path.splitext(os.path.abspath(args_cli.out))[0] + "_groups.csv"
+        header = list(group_rows[0].keys())
+        with open(group_path, "w") as f:
+            f.write(",".join(header) + "\n")
+            for row in group_rows:
+                f.write(",".join(v if isinstance(v, str) else f"{v:.6f}" for v in row.values()) + "\n")
+        print(f"[INFO] wrote {group_path}")
 
     env.close()
 

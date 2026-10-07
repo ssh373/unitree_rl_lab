@@ -81,39 +81,22 @@ class RslRlAmpCfg:
     """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
     obs_group: str = "amp"
     speed_range: tuple[float, float] = (0.2, 2.5)
-    """Planar-speed gate on reference transitions. The upper bound is the command ceiling. The lower bound
-    admits everything down to standing: the study compares the arms at 2 m/s only, so a human-like *walk*
-    at slow commands is acceptable (decision 2026-09-21). Two earlier floors are documented in the project
-    notes: 0.2 taught walking at every speed and stalled the velocity curriculum at 0.9 m/s; 1.0 kept the
-    running gait but, once active, pulled ``track_lin_vel_xy`` under the curriculum's 0.8*weight threshold
-    and stalled it at 1.3 m/s. Neither reached 2 m/s -- pair any floor with a reward ramp that starts after
-    the curriculum has opened. Keep ``command_gate`` at or above this floor."""
+    clip_speed_ranges: list[tuple[float, float]] | None = None
+    """Optional per-clip speed gate, one ``(lo, hi)`` per entry of ``motion_files``; ``None`` applies
+    ``speed_range`` to every clip. Lets the reference set be banded by gait (walk takes at low speed, run
+    takes at high speed) so speed-matched sampling pairs a walking command with a walk and a running
+    command with a run."""
     speed_matched_sampling: bool = True
     speed_match_window: float = 0.1
-    """Pair every policy transition shown to the discriminator with a reference transition within
-    ``±speed_match_window`` m/s of its speed, so the discriminator cannot separate the two sides by speed
-    (first run with uniform sampling and weight 0.5 ran at 0.7 m/s regardless of a 0.2 m/s command)."""
 
     reward_weight: float = 2.0
-    """Final weight of the style reward in reward-manager units (the extension multiplies it by ``step_dt``
-    like every task reward weight), so 2.0 puts a saturated style reward on a par with ``track_lin_vel_xy``.
-    Until 2026-09-22 the dt factor was missing and the old default 0.2 acted as a weight of 10: the style
-    term (~4/s) outweighed the whole task reward and policies stood still on the slowest reference frames."""
     reward_weight_start: float = 0.0
     ramp_start_iter: int = 0
     ramp_end_iter: int = 0
-    """Linear ramp of the style weight from ``reward_weight_start`` to ``reward_weight`` over PPO iterations.
-    Equal start/end iterations disable it (the weight is then ``reward_weight`` throughout). Kept as a plain
-    float rather than ``float | None`` so Hydra overrides (``agent.algorithm.amp_cfg.ramp_end_iter=...``) pass
-    the config type check."""
-
+    
     command_name: str | None = "base_velocity"
     command_gate: float = 0.1
-    """Below this commanded planar speed an environment gets no style reward and its transitions are not
-    shown to the discriminator. 0.1 excludes only the standing environments (``rel_standing_envs``), matching
-    ``_command_run_gate`` in the task rewards. Must not be below ``speed_range[0]``: a policy transition
-    slower than every reference transition would hand the discriminator speed as a cue again."""
-
+    
     hidden_dims: tuple[int, ...] = (1024, 512)
     activation: str = "relu"
     normalize_input: bool = True
@@ -141,6 +124,46 @@ LAFAN1_RUN_CLIPS = [
 ]
 """LAFAN1 running takes retargeted to G1 (30 fps csv in the same directory; npz built locally)."""
 
+_LAFAN1_WALK_DIR = os.path.join(os.path.dirname(_LAFAN1_RUN_DIR), "lafan1_walk")
+LAFAN1_WALK_CLIPS = [
+    os.path.join(_LAFAN1_WALK_DIR, f"{name}.npz")
+    for name in (
+        "walk1_subject1", "walk1_subject2", "walk1_subject5",
+        "walk2_subject1", "walk2_subject3", "walk2_subject4",
+        "walk3_subject1", "walk3_subject2", "walk3_subject3", "walk3_subject4", "walk3_subject5",
+        "walk4_subject1",
+    )
+]
+"""LAFAN1 walking takes retargeted to G1 (30 fps csv in the same directory; npz built locally with
+``csv_to_npz.py --input_fps 30``). Root speed: mean 0.2-0.8 m/s, 48-81% of frames in 0.2-1.0 m/s."""
+
+# TEMP (2026-10-02): speed-banded reference set. Walk takes feed the discriminator below 1.0 m/s, run and
+# sprint takes from 1.0 m/s up to the 2.5 m/s command ceiling, so at a walking command the speed-matched
+# reference is a human walk and at a running command a human run. Replaces the single run1_subject5 clip,
+# which has almost no data below 0.6 m/s (speed matching fell back to nearest neighbours there).
+AMP_WALK_SPEED_BAND = (0.2, 1.0)
+AMP_RUN_SPEED_BAND = (1.0, 2.5)
+LAFAN1_BANDED_CLIPS = LAFAN1_WALK_CLIPS + LAFAN1_RUN_CLIPS
+LAFAN1_BANDED_SPEED_RANGES = [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_CLIPS) + [AMP_RUN_SPEED_BAND] * len(
+    LAFAN1_RUN_CLIPS
+)
+
+# TEMP (2026-10-06): low-CoT reference set. Top two takes per band by inverse-dynamics mechanical CoT
+# (sum max(tau*qdot, 0) / mgd at matched speed; ranking stable across contact thresholds), plus every
+# kimodo clip. Kimodo csv was wxyz and is now stored xyzw like LAFAN1 (originals in kimodo/orig_wxyz/).
+_KIMODO_DIR = os.path.join(os.path.dirname(_LAFAN1_RUN_DIR), "kimodo")
+LAFAN1_WALK_LOWCOT_CLIPS = [os.path.join(_LAFAN1_WALK_DIR, f"{n}.npz") for n in ("walk3_subject4", "walk1_subject1")]
+LAFAN1_RUN_LOWCOT_CLIPS = [os.path.join(_LAFAN1_RUN_DIR, f"{n}.npz") for n in ("run2_subject4", "run1_subject5")]
+KIMODO_CLIPS = [os.path.join(_KIMODO_DIR, f"kimodo_{i}.npz") for i in range(1, 5)]
+"""Kimodo-generated G1 clips (10 s each, 30 fps csv; npz built with ``csv_to_npz.py --input_fps 30``)."""
+AMP_KIMODO_SPEED_BAND = (0.2, 2.5)
+LOWCOT_CLIPS = LAFAN1_WALK_LOWCOT_CLIPS + LAFAN1_RUN_LOWCOT_CLIPS + KIMODO_CLIPS
+LOWCOT_SPEED_RANGES = (
+    [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_LOWCOT_CLIPS)
+    + [AMP_RUN_SPEED_BAND] * len(LAFAN1_RUN_LOWCOT_CLIPS)
+    + [AMP_KIMODO_SPEED_BAND] * len(KIMODO_CLIPS)
+)
+
 LAFAN1_RUN_SINGLE_CLIP = [os.path.join(_LAFAN1_RUN_DIR, "run1_subject5.npz")]
 """Single-clip option: the take with the fewest idle frames (3%) and the highest share inside the command
 range (89% within 0.2-2.5 m/s). Not the default: with speed-matched sampling the discriminator needs
@@ -150,12 +173,6 @@ accelerations), whereas the six clips together have 23% there."""
 
 @configclass
 class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
-    """Running PPO with an AMP style reward from human running motions (ablation B).
-
-    Identical to :class:`RunningPPORunnerCfg` except that the ``amp`` observation set is routed to
-    the algorithm and PPO is extended with the AMP discriminator. The policy and the task rewards
-    are untouched, so the only difference to the baseline run is the style reward.
-    """
 
     class_name: str = "ExtendedOnPolicyRunner"
     obs_groups = {"policy": ["policy"], "critic": ["critic"], "amp": ["amp"]}
@@ -177,7 +194,11 @@ class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
             use_mirror_loss=False,
             data_augmentation_func=compute_g1_29dof_symmetric_states,
         ),
+        # TEMP (2026-10-06): low-CoT set -- top-2 walk (0.2-1.0) + top-2 run (1.0-2.5) + kimodo (0.2-2.5).
+        amp_cfg=RslRlAmpCfg(motion_files=LOWCOT_CLIPS, clip_speed_ranges=LOWCOT_SPEED_RANGES),
+        # TEMP (2026-10-02): all walk clips gated to 0.2-1.0 m/s + run/sprint clips gated to 1.0-2.5 m/s.
+        # amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_BANDED_CLIPS, clip_speed_ranges=LAFAN1_BANDED_SPEED_RANGES),
         # Single clip (user decision 2026-09-23): run1_subject5, the cleanest take. Low-speed coverage is
         # thin (5% below 0.6 m/s), so speed-matched sampling falls back to nearest neighbours there.
-        amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_SINGLE_CLIP),
+        # amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_SINGLE_CLIP),
     )

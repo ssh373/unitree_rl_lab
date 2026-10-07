@@ -111,6 +111,7 @@ class ClipStats:
     speed_max: float
     kept_pairs: int
     total_pairs: int
+    speed_range: tuple[float, float] = (0.2, 2.5)
 
     @property
     def kept_fraction(self) -> float:
@@ -132,12 +133,34 @@ class AmpMotionData:
         motion_files: list[str] | tuple[str, ...],
         speed_range: tuple[float, float] = (0.2, 2.5),
         device: str = "cpu",
+        clip_speed_ranges: list[tuple[float, float] | None] | None = None,
     ):
+        """
+        Args:
+            motion_files: Motion npz files produced by ``csv_to_npz.py``.
+            speed_range: Planar-speed gate applied to every clip that has no entry in
+                ``clip_speed_ranges``.
+            device: Torch device the feature tensor is moved to in :meth:`prepare`.
+            clip_speed_ranges: Optional per-clip gate, one ``(lo, hi)`` per entry of ``motion_files``
+                (``None`` entries fall back to ``speed_range``). Used to band the reference set by
+                gait, e.g. walking takes below 1 m/s and running takes above it, so that the
+                speed-matched sampler draws a walk at walking commands and a run at running
+                commands instead of whichever gait the takes happen to hold at that speed.
+        """
         if not motion_files:
             raise ValueError("AmpMotionData needs at least one motion file.")
         self.motion_files = list(motion_files)
-        self.speed_range = speed_range
+        self.speed_range = tuple(speed_range)
         self.device = device
+        if clip_speed_ranges is None:
+            clip_speed_ranges = [None] * len(self.motion_files)
+        if len(clip_speed_ranges) != len(self.motion_files):
+            raise ValueError(
+                f"clip_speed_ranges has {len(clip_speed_ranges)} entries for {len(self.motion_files)} motion files."
+            )
+        self.clip_speed_ranges: list[tuple[float, float]] = [
+            self.speed_range if r is None else (float(r[0]), float(r[1])) for r in clip_speed_ranges
+        ]
 
         self._clips: list[dict[str, np.ndarray]] = []
         self.clip_stats: list[ClipStats] = []
@@ -154,11 +177,11 @@ class AmpMotionData:
                 + "\nThe npz files are gitignored and must be rebuilt from the csv next to them:\n"
                 "  python scripts/mimic/csv_to_npz.py -f <clip>.csv --input_fps 30 --headless"
             )
-        for path in self.motion_files:
-            self._clips.append(self._load_clip(path))
+        for path, clip_range in zip(self.motion_files, self.clip_speed_ranges):
+            self._clips.append(self._load_clip(path, clip_range))
 
-    def _load_clip(self, path: str) -> dict[str, np.ndarray]:
-        """Read one npz and select the transition pairs that pass the speed gate."""
+    def _load_clip(self, path: str, speed_range: tuple[float, float]) -> dict[str, np.ndarray]:
+        """Read one npz and select the transition pairs that pass the clip's speed gate."""
         with np.load(path) as raw:
             fps = float(raw["fps"][0])
             joint_pos = raw["joint_pos"].astype(np.float32)
@@ -169,7 +192,7 @@ class AmpMotionData:
 
         # Planar speed decides the gate: vertical motion is part of running, not a measure of it.
         speed = np.linalg.norm(root_lin_vel[:, :2], axis=-1)
-        lo, hi = self.speed_range
+        lo, hi = speed_range
         in_range = (speed >= lo) & (speed <= hi)
         # A pair is usable only if both of its frames are in range, and pairs never straddle clips.
         keep = in_range[:-1] & in_range[1:]
@@ -185,6 +208,7 @@ class AmpMotionData:
                 speed_max=float(speed.max()),
                 kept_pairs=int(len(indices)),
                 total_pairs=int(len(keep)),
+                speed_range=(float(lo), float(hi)),
             )
         )
         return {
@@ -214,7 +238,7 @@ class AmpMotionData:
         features = torch.cat([f for f in per_clip if len(f)], dim=0)
         if not len(features):
             raise ValueError(
-                f"The speed gate {self.speed_range} removed every transition in "
+                f"The speed gate(s) {sorted(set(self.clip_speed_ranges))} removed every transition in "
                 f"{len(self.motion_files)} clip(s). Widen the range or check the motion files."
             )
         # Sorted by speed so that speed-matched sampling is a pair of searchsorted calls.
@@ -313,10 +337,13 @@ class AmpMotionData:
 
     def describe(self) -> str:
         """One line per clip plus a total, for the training log."""
-        lines = [f"AMP reference data: {len(self.clip_stats)} clip(s), speed gate {self.speed_range} m/s"]
+        gates = sorted(set(self.clip_speed_ranges))
+        gate_str = f"speed gate {gates[0]} m/s" if len(gates) == 1 else f"per-clip speed gates {gates} m/s"
+        lines = [f"AMP reference data: {len(self.clip_stats)} clip(s), {gate_str}"]
         for s in self.clip_stats:
             lines.append(
                 f"  {s.name:<20} {s.duration_s:7.1f}s  v_mean {s.speed_mean:4.2f}  v_max {s.speed_max:4.2f}"
+                f"  gate [{s.speed_range[0]:.1f}, {s.speed_range[1]:.1f}]"
                 f"  kept {s.kept_pairs:6d}/{s.total_pairs:6d} ({s.kept_fraction * 100:4.1f}%)"
             )
         kept = sum(s.kept_pairs for s in self.clip_stats)
