@@ -64,10 +64,13 @@ class RewardsCfg(BaseRewardsCfg):
     # Wrists only (2026-10-07): arm_lateral was the one term holding the six wrist joints, and without it
     # the AMP policies shake the wrists -- the retargeted reference wrists are IK noise (pos std 0.14-0.58
     # rad, left/right asymmetric) that the discriminator rewards and the 5 Nm W4010 motors chase. Same
-    # weight and kernel as the base term; shoulder roll/yaw stay free for the discriminator.
+    # kernel as the base term; shoulder roll/yaw stay free for the discriminator.
+    # Weight starts at 0 and the standing gate in CurriculumCfg ramps it to WRIST_DEVIATION_WEIGHT once
+    # the policy stands (2026-10-12): the 10-07 runs with a constant -0.5 never left the falling phase
+    # in 30k iterations, so before standing this arm's rewards are now identical to the 10-06 run.
     joint_deviation_wrist = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.5,
+        weight=0.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
     )
     # Knee flexion: the -10 weight (set 2026-09-15) straightened the knee (std 0.16 rad vs 0.45 in the
@@ -104,10 +107,16 @@ class RewardsCfg(BaseRewardsCfg):
     # )
 
 
-# PACE standing gate -- disabled together with joint_energy_pace above (2026-10-02).
-# @configclass
-# class CurriculumCfg(BaseCurriculumCfg):
-#     joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
+WRIST_DEVIATION_WEIGHT = -0.5  # same as joint_deviation_arm_lateral in the base cfg
+
+
+# Standing gates (weight 0 until the mean episode length passes STAND_EP_LEN, then a 500-iter ramp),
+# shared tracker and latch with the energy variants. The PACE line stays commented together with the
+# joint_energy_pace term above (2026-10-02); uncomment both to re-enable it.
+@configclass
+class CurriculumCfg(BaseCurriculumCfg):
+    joint_deviation_wrist_weight = _gate("joint_deviation_wrist", WRIST_DEVIATION_WEIGHT)
+    # joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
 
 
 # Where the velocity curriculum starts. The baseline starts at (-0.4, 0.4); the AMP arm starts
@@ -128,7 +137,7 @@ AMP_START_LIN_VEL_X = (0.5, 1.2)
 class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
-    # curriculum: CurriculumCfg = CurriculumCfg()      # PACE gate, disabled 2026-10-02 (see above)
+    curriculum: CurriculumCfg = CurriculumCfg()  # wrist standing gate (+ PACE gate when re-enabled)
 
     def __post_init__(self):
         super().__post_init__()
