@@ -1,4 +1,7 @@
 
+import math
+
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -7,19 +10,19 @@ from unitree_rl_lab.tasks.locomotion import mdp
 from unitree_rl_lab.tasks.locomotion.mdp.amp_observations import AmpObsCfg
 
 from .running_env_cfg import GAIT_FEET_BODY_NAMES
+from .running_env_cfg import EventCfg as BaseEventCfg
 from .running_env_cfg import ObservationsCfg as BaseObservationsCfg
 from .running_env_cfg import RewardsCfg as BaseRewardsCfg
 from .running_env_cfg import RobotEnvCfg as BaseRobotEnvCfg
 from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 
 from .running_env_cfg import CurriculumCfg as BaseCurriculumCfg
-from .running_reward_env_cfg import (
-    PACE_ENERGY_WEIGHT,
-    PACE_K_EL,
-    PACE_K_REGEN,
-    PACE_SPEED_EXPONENT,
-    _gate,
-)
+from .running_reward_env_cfg import _gate
+from unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg import LOWCOT_CLIPS, LOWCOT_SPEED_RANGES
+
+# PACE constants (PACE_ENERGY_WEIGHT, PACE_K_EL, PACE_K_REGEN, PACE_SPEED_EXPONENT) were imported from
+# running_reward_env_cfg until 2026-10-12, when its PACE block was commented out. The joint_energy_pace
+# term below has been commented out since 10-02, so the import went with it; restore both together.
 
 
 
@@ -109,6 +112,29 @@ class RewardsCfg(BaseRewardsCfg):
 
 WRIST_DEVIATION_WEIGHT = -0.5  # same as joint_deviation_arm_lateral in the base cfg
 
+# Reference state initialisation (AMP paper): the fraction of resets that start from a reference frame.
+# The clip list must match the discriminator's (RunningAmpPPORunnerCfg.algorithm.amp_cfg) so the policy
+# only starts from states the discriminator rewards. 0.8 keeps 20% default-pose starts for robustness.
+RSI_PROBABILITY = 0.8
+
+
+@configclass
+class EventCfg(BaseEventCfg):
+    """Baseline events plus RSI, declared last so it overrides reset_base / reset_robot_joints."""
+
+    reset_from_reference = EventTerm(
+        func=mdp.reset_from_reference,
+        mode="reset",
+        params={
+            "motion_files": LOWCOT_CLIPS,
+            "clip_speed_ranges": LOWCOT_SPEED_RANGES,
+            "probability": RSI_PROBABILITY,
+            "yaw_range": (-math.pi, math.pi),
+            "xy_range": 0.5,
+            "height_clearance": 0.01,
+        },
+    )
+
 
 # Standing gates (weight 0 until the mean episode length passes STAND_EP_LEN, then a 500-iter ramp),
 # shared tracker and latch with the energy variants. The PACE line stays commented together with the
@@ -137,6 +163,7 @@ AMP_START_LIN_VEL_X = (0.5, 1.2)
 class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
+    events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()  # wrist standing gate (+ PACE gate when re-enabled)
 
     def __post_init__(self):
@@ -146,5 +173,8 @@ class RobotEnvCfg(BaseRobotEnvCfg):
 
 @configclass
 class RobotPlayEnvCfg(BaseRobotPlayEnvCfg):
+    """Play / evaluation: default-pose resets only, so the energy and impact protocols stay comparable
+    across arms and never need the motion files."""
+
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()

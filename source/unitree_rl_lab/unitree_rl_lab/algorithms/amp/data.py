@@ -189,6 +189,7 @@ class AmpMotionData:
             root_quat = raw["body_quat_w"][:, ROOT_BODY_INDEX].astype(np.float32)
             root_lin_vel = raw["body_lin_vel_w"][:, ROOT_BODY_INDEX].astype(np.float32)
             root_ang_vel = raw["body_ang_vel_w"][:, ROOT_BODY_INDEX].astype(np.float32)
+            root_pos_z = raw["body_pos_w"][:, ROOT_BODY_INDEX, 2].astype(np.float32)
 
         # Planar speed decides the gate: vertical motion is part of running, not a measure of it.
         speed = np.linalg.norm(root_lin_vel[:, :2], axis=-1)
@@ -217,8 +218,34 @@ class AmpMotionData:
             "root_quat": root_quat,
             "root_lin_vel": root_lin_vel,
             "root_ang_vel": root_ang_vel,
+            "root_pos_z": root_pos_z,
             "indices": indices,
+            "frame_indices": np.nonzero(in_range)[0],
         }
+
+    def reset_states(self) -> dict[str, torch.Tensor]:
+        """Every frame that passes its clip's speed gate, as the state a reset can write to the simulator.
+
+        Returns ``root_pos_z``, ``root_quat`` (w, x, y, z, world), ``root_lin_vel_w``, ``root_ang_vel_w``,
+        ``joint_pos`` and ``joint_vel`` stacked over clips, on ``self.device``. Used by the reference
+        state initialisation event (AMP paper: episodes start from states sampled from the reference
+        motions). Must be called before :meth:`prepare`, which drops the raw arrays.
+        """
+        if not self._clips:
+            raise RuntimeError("reset_states() needs the raw clips; call it before prepare().")
+        keys = {
+            "root_pos_z": "root_pos_z",
+            "root_quat": "root_quat",
+            "root_lin_vel_w": "root_lin_vel",
+            "root_ang_vel_w": "root_ang_vel",
+            "joint_pos": "joint_pos",
+            "joint_vel": "joint_vel",
+        }
+        out = {}
+        for name, key in keys.items():
+            parts = [clip[key][clip["frame_indices"]] for clip in self._clips if len(clip["frame_indices"])]
+            out[name] = torch.from_numpy(np.concatenate(parts, axis=0)).to(self.device)
+        return out
 
     def prepare(self, default_joint_pos: torch.Tensor, default_joint_vel: torch.Tensor) -> None:
         """Build the feature tensor using the robot's default joint state.
@@ -352,6 +379,49 @@ class AmpMotionData:
         if self._speeds is not None:
             lines.append(self.speed_coverage())
         return "\n".join(lines)
+
+
+class AmpReplayBuffer:
+    """Circular buffer of policy transitions for discriminator training (AMP paper, Sec. 5).
+
+    Without it the discriminator only ever sees the rollout just collected, overfits to the current
+    policy, and the two chase each other. Keeping the last ``capacity`` policy transitions gives it a
+    history to separate from the reference set instead of a single snapshot.
+    """
+
+    def __init__(self, capacity: int, num_features: int, device: str = "cpu"):
+        self.capacity = int(capacity)
+        self.buffer = torch.zeros(self.capacity, num_features, device=device)
+        self._pos = 0
+        self._full = False
+
+    @property
+    def size(self) -> int:
+        return self.capacity if self._full else self._pos
+
+    def insert(self, transitions: torch.Tensor) -> None:
+        n = transitions.shape[0]
+        if n == 0:
+            return
+        if n >= self.capacity:
+            self.buffer.copy_(transitions[-self.capacity :])
+            self._pos, self._full = 0, True
+            return
+        end = self._pos + n
+        if end <= self.capacity:
+            self.buffer[self._pos : end] = transitions
+        else:
+            first = self.capacity - self._pos
+            self.buffer[self._pos :] = transitions[:first]
+            self.buffer[: n - first] = transitions[first:]
+        self._pos = end % self.capacity
+        self._full = self._full or end >= self.capacity
+
+    def sample(self, batch_size: int) -> torch.Tensor:
+        if self.size == 0:
+            raise RuntimeError("AmpReplayBuffer is empty.")
+        idx = torch.randint(0, self.size, (batch_size,), device=self.buffer.device)
+        return self.buffer[idx]
 
 
 def _main() -> None:

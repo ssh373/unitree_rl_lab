@@ -69,6 +69,33 @@ def joint_torque_normalized_l2(
     return torch.sum(torch.square(torque / limit), dim=-1)
 
 
+def feet_impact_impulse(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    window_s: float = 0.04,
+    min_air_s: float = 0.04,
+) -> torch.Tensor:
+    """Landing impulse: ``int |F| dt`` over the first ``window_s`` after touchdown, summed over feet.
+
+    Per foot, the net contact force is integrated over the physics substeps of this policy step
+    (``history_length`` must equal ``decimation`` so every substep is covered) and counted only
+    while the contact is younger than ``window_s`` and followed an air gap of at least
+    ``min_air_s``. The second condition drops sole flicker (a bounce or roll inside one stance),
+    which otherwise registers as a new touchdown. The support phase and push-off are never
+    penalized: the whole-stance impulse is fixed by momentum balance, only the landing is free.
+    Same definition as J40 in ``scripts/rsl_rl/eval_impact.py`` / ``trace_impact.py``
+    (2026-10-12: baseline 17 N*s, Energy reward 20 N*s per touchdown at 2 m/s).
+    """
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    force = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1)  # (N, H, feet)
+    impulse = force.sum(dim=1) * env.physics_dt
+    t_contact = sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    air_before = sensor.data.last_air_time[:, sensor_cfg.body_ids]
+    # 1e-4 tolerance: contact time is accumulated in float32 substeps, so 8 x 0.005 lands a hair above 0.04
+    landing = (t_contact > 0.0) & (t_contact <= window_s + 1e-4) & (air_before >= min_air_s)
+    return torch.sum(impulse * landing, dim=1)
+
+
 def joint_power_cot_exp(
     env: ManagerBasedRLEnv,
     sigma_lin: float = 2800.0,

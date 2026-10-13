@@ -80,7 +80,9 @@ class RslRlAmpCfg:
     motion_files: list[str] = MISSING
     """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
     obs_group: str = "amp"
-    speed_range: tuple[float, float] = (0.2, 2.5)
+    speed_range: tuple[float, float] = (0.0, 2.5)
+    """Default per-transition speed gate. Lower bound 0.0 since 2026-10-13 so standing frames count as
+    reference (AMP paper samples the whole dataset); per-clip bands below override it."""
     clip_speed_ranges: list[tuple[float, float]] | None = None
     """Optional per-clip speed gate, one ``(lo, hi)`` per entry of ``motion_files``; ``None`` applies
     ``speed_range`` to every clip. Lets the reference set be banded by gait (walk takes at low speed, run
@@ -89,21 +91,37 @@ class RslRlAmpCfg:
     speed_matched_sampling: bool = True
     speed_match_window: float = 0.1
 
-    reward_weight: float = 2.0
+    reward_weight: float = 3.0
+    """Style reward weight in task-reward units. 2.0 (= track_lin_vel_xy) until 2026-10-13; 3.0 moves the
+    style term towards the AMP paper's equal blend with the task reward without reaching the 09-21
+    regime (effective 10) where the policy stood still for style reward."""
+    task_reward_scale: float = 1.0
+    """Multiplier on the task reward before the style term is added (AMP paper w_G; TUM uses 0.7)."""
     reward_weight_start: float = 0.0
     ramp_start_iter: int = 0
     ramp_end_iter: int = 0
     
     command_name: str | None = "base_velocity"
-    command_gate: float = 0.1
+    command_gate: float = 0.0
+    """Commands below this get no style reward. 0.0 since 2026-10-13: standing frames are in the reference
+    set, so standing environments are scored against standing references (speed matching pairs them)."""
     
     hidden_dims: tuple[int, ...] = (1024, 512)
     activation: str = "relu"
     normalize_input: bool = True
     grad_penalty_coef: float = 10.0
+    logit_reg_coef: float = 0.05
+    """L2 on the discriminator's logit layer (authors' Isaac Gym implementation: 0.05)."""
+    weight_decay: float = 1.0e-4
+    """Discriminator optimizer weight decay (authors' implementation: 1e-4)."""
     learning_rate: float = 1.0e-4
-    num_updates_per_iter: int = 10
-    batch_size: int = 4096
+    num_updates_per_iter: int = 20
+    """Discriminator minibatches per PPO update; 20 = num_learning_epochs x num_mini_batches, i.e. one
+    discriminator step per policy minibatch as in the AMP paper (was 10)."""
+    batch_size: int = 16384
+    """Per minibatch, each side (was 4096)."""
+    replay_buffer_size: int = 100_000
+    """Policy transitions kept across rollouts for the discriminator (AMP paper replay buffer)."""
     use_symmetry_augmentation: bool = True
 
 
@@ -141,7 +159,9 @@ LAFAN1_WALK_CLIPS = [
 # sprint takes from 1.0 m/s up to the 2.5 m/s command ceiling, so at a walking command the speed-matched
 # reference is a human walk and at a running command a human run. Replaces the single run1_subject5 clip,
 # which has almost no data below 0.6 m/s (speed matching fell back to nearest neighbours there).
-AMP_WALK_SPEED_BAND = (0.2, 1.0)
+# Walk band from 0.0 (2026-10-13): the idle stretches of the walk takes -- a person standing about -- are
+# the standing reference the task needs at zero command. Run takes stay gated from 1.0 m/s.
+AMP_WALK_SPEED_BAND = (0.0, 1.0)
 AMP_RUN_SPEED_BAND = (1.0, 2.5)
 LAFAN1_BANDED_CLIPS = LAFAN1_WALK_CLIPS + LAFAN1_RUN_CLIPS
 LAFAN1_BANDED_SPEED_RANGES = [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_CLIPS) + [AMP_RUN_SPEED_BAND] * len(
@@ -156,7 +176,7 @@ LAFAN1_WALK_LOWCOT_CLIPS = [os.path.join(_LAFAN1_WALK_DIR, f"{n}.npz") for n in 
 LAFAN1_RUN_LOWCOT_CLIPS = [os.path.join(_LAFAN1_RUN_DIR, f"{n}.npz") for n in ("run2_subject4", "run1_subject5")]
 KIMODO_CLIPS = [os.path.join(_KIMODO_DIR, f"kimodo_{i}.npz") for i in range(1, 5)]
 """Kimodo-generated G1 clips (10 s each, 30 fps csv; npz built with ``csv_to_npz.py --input_fps 30``)."""
-AMP_KIMODO_SPEED_BAND = (0.2, 2.5)
+AMP_KIMODO_SPEED_BAND = (0.0, 2.5)
 LOWCOT_CLIPS = LAFAN1_WALK_LOWCOT_CLIPS + LAFAN1_RUN_LOWCOT_CLIPS + KIMODO_CLIPS
 LOWCOT_SPEED_RANGES = (
     [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_LOWCOT_CLIPS)

@@ -41,7 +41,7 @@ from typing import Any
 import torch
 from tensordict import TensorDict
 
-from unitree_rl_lab.algorithms.amp.data import AmpMotionData, transition_speed
+from unitree_rl_lab.algorithms.amp.data import AmpMotionData, AmpReplayBuffer, transition_speed
 from unitree_rl_lab.algorithms.amp.discriminator import AmpDiscriminator
 from unitree_rl_lab.algorithms.extensions import PPOExtension
 
@@ -59,6 +59,7 @@ class AMPExtension(PPOExtension):
         speed_matched_sampling: bool = True,
         speed_match_window: float = 0.1,
         reward_weight: float = 2.0,
+        task_reward_scale: float = 1.0,
         reward_weight_start: float = 0.0,
         ramp_start_iter: int = 0,
         ramp_end_iter: int = 0,
@@ -68,9 +69,12 @@ class AMPExtension(PPOExtension):
         activation: str = "relu",
         normalize_input: bool = True,
         grad_penalty_coef: float = 10.0,
+        logit_reg_coef: float = 0.0,
+        weight_decay: float = 0.0,
         learning_rate: float = 1.0e-4,
         num_updates_per_iter: int = 10,
         batch_size: int = 4096,
+        replay_buffer_size: int = 0,
         use_symmetry_augmentation: bool = True,
         device: str = "cpu",
         _env=None,
@@ -88,13 +92,21 @@ class AMPExtension(PPOExtension):
             speed_match_window: Half-width in m/s of the speed window used for matching.
             reward_weight: Final weight of the style reward, in reward-manager units (scaled by
                 ``step_dt`` like every task reward weight; 2.0 matches ``track_lin_vel_xy``).
+            task_reward_scale: Multiplier on the task reward before the style reward is added
+                (``r = task_reward_scale * r_task + reward_weight * dt * r_style``). The AMP paper
+                blends the two as ``w_G r_G + w_S r_S``; 1.0 keeps the task reward untouched.
             reward_weight_start: Weight at ``ramp_start_iter``; ignored when the ramp is disabled.
             ramp_start_iter / ramp_end_iter: PPO iterations over which the weight ramps linearly.
             command_name / command_gate: Zero the style reward when the planar speed command is below
                 ``command_gate``. ``command_name=None`` disables the gate.
-            hidden_dims, activation, normalize_input, grad_penalty_coef: Discriminator settings.
+            hidden_dims, activation, normalize_input, grad_penalty_coef, logit_reg_coef: Discriminator
+                settings (see :class:`AmpDiscriminator`).
+            weight_decay: L2 weight decay of the discriminator optimizer (authors' implementation: 1e-4).
             learning_rate: Discriminator Adam learning rate (kept below the policy's).
             num_updates_per_iter / batch_size: Discriminator minibatches per PPO update and their size.
+            replay_buffer_size: Policy transitions kept across rollouts for discriminator training
+                (AMP paper, Sec. 5). 0 trains on the current rollout only. The buffer is not part of the
+                checkpoint; after a resume it refills from the first rollouts.
             use_symmetry_augmentation: Mirror reference batches when PPO mirrors policy batches.
             device: Torch device.
             _env: The environment; injected by the runner so the default joint state and the command
@@ -104,6 +116,7 @@ class AMPExtension(PPOExtension):
         self.speed_matched_sampling = speed_matched_sampling
         self.speed_match_window = speed_match_window
         self.reward_weight_end = reward_weight
+        self.task_reward_scale = task_reward_scale
         self.reward_weight_start = reward_weight_start
         self.ramp_start_iter = ramp_start_iter
         self.ramp_end_iter = ramp_end_iter
@@ -111,6 +124,9 @@ class AMPExtension(PPOExtension):
         self.command_gate = command_gate
         self.num_updates_per_iter = num_updates_per_iter
         self.batch_size = batch_size
+        self.replay_buffer_size = int(replay_buffer_size)
+        self.replay: AmpReplayBuffer | None = None
+        self.weight_decay = weight_decay
         self.use_symmetry_augmentation = use_symmetry_augmentation
         self.device = device
         self._env = _env
@@ -126,6 +142,7 @@ class AMPExtension(PPOExtension):
             activation=activation,
             normalize_input=normalize_input,
             grad_penalty_coef=grad_penalty_coef,
+            logit_reg_coef=logit_reg_coef,
         )
         self.learning_rate = learning_rate
         self.optimizer: torch.optim.Optimizer | None = None
@@ -153,7 +170,11 @@ class AMPExtension(PPOExtension):
 
     def _build(self, num_features: int) -> None:
         self.discriminator = AmpDiscriminator(num_features, device=self.device, **self._disc_kwargs)
-        self.optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.learning_rate)
+        self.optimizer = torch.optim.Adam(
+            self.discriminator.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+        )
+        if self.replay_buffer_size > 0:
+            self.replay = AmpReplayBuffer(self.replay_buffer_size, num_features, device=self.device)
         if self._pending_state is not None:
             self.discriminator.load_state_dict(self._pending_state["discriminator"])
             self.optimizer.load_state_dict(self._pending_state["optimizer"])
@@ -208,7 +229,7 @@ class AMPExtension(PPOExtension):
         # weights (2.0 = parity with ``track_lin_vel_xy``). Before 2026-09-22 the dt was missing,
         # so 0.2 acted like a weight of 10 and the style term outweighed the whole task reward.
         dt = self._env.unwrapped.step_dt if self._env is not None else 1.0
-        return rewards + self.reward_weight * dt * style.to(rewards.device).view_as(rewards)
+        return self.task_reward_scale * rewards + self.reward_weight * dt * style.to(rewards.device).view_as(rewards)
 
     # -- discriminator training ----------------------------------------------------------------
 
@@ -268,9 +289,16 @@ class AMPExtension(PPOExtension):
             self._style_reward_count = 0
             return {"amp/reward_weight": self.reward_weight, "amp/gated_fraction": 0.0, "amp/style_reward_mean": 0.0}
         logs["amp/gated_fraction"] = [gated_fraction]
+        if self.replay is not None:
+            # The rollout joins the history; the discriminator then samples from the whole history.
+            self.replay.insert(policy_all.to(self.replay.buffer.device))
+            logs["amp/replay_size"] = [float(self.replay.size)]
         for _ in range(self.num_updates_per_iter):
-            idx = torch.randint(0, policy_all.shape[0], (self.batch_size,), device=policy_all.device)
-            policy_batch = policy_all[idx]
+            if self.replay is not None:
+                policy_batch = self.replay.sample(self.batch_size).to(policy_all.device)
+            else:
+                idx = torch.randint(0, policy_all.shape[0], (self.batch_size,), device=policy_all.device)
+                policy_batch = policy_all[idx]
             policy_speed = transition_speed(policy_batch)
             if self.speed_matched_sampling:
                 reference_batch = self.data.sample_matched(policy_speed, self.speed_match_window)
