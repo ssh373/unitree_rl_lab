@@ -34,6 +34,7 @@ class AmpDiscriminator(nn.Module):
         activation: str = "relu",
         normalize_input: bool = True,
         grad_penalty_coef: float = 10.0,
+        logit_reg_coef: float = 0.0,
         device: str = "cpu",
     ):
         """
@@ -43,11 +44,15 @@ class AmpDiscriminator(nn.Module):
             activation: Hidden activation.
             normalize_input: Standardise inputs with running statistics before the MLP.
             grad_penalty_coef: Weight of the gradient penalty on reference inputs (paper: 10).
+            logit_reg_coef: L2 penalty on the weights of the output (logit) layer, the ``disc_logit_reg``
+                of the authors' Isaac Gym implementation (0.05 there). Keeps the logits from growing
+                without bound once the two sides are easy to separate. 0 disables it.
             device: Torch device.
         """
         super().__init__()
         self.num_features = num_features
         self.grad_penalty_coef = grad_penalty_coef
+        self.logit_reg_coef = logit_reg_coef
         self.device = device
 
         if normalize_input:
@@ -103,11 +108,13 @@ class AmpDiscriminator(nn.Module):
         )[0]
         grad_penalty = torch.mean(torch.sum(grad**2, dim=-1))
 
-        total = loss_ref + loss_pol + self.grad_penalty_coef * grad_penalty
+        logit_reg = torch.sum(torch.square(self.trunk[-1].weight))  # the MLP's last layer is the logit layer
+        total = loss_ref + loss_pol + self.grad_penalty_coef * grad_penalty + self.logit_reg_coef * logit_reg
         info = {
             "amp/loss_reference": loss_ref.item(),
             "amp/loss_policy": loss_pol.item(),
             "amp/grad_penalty": grad_penalty.item(),
+            "amp/logit_reg": logit_reg.item(),
             "amp/d_reference": d_ref.mean().item(),
             "amp/d_policy": d_pol.mean().item(),
             "amp/acc_reference": (d_ref > 0).float().mean().item(),
