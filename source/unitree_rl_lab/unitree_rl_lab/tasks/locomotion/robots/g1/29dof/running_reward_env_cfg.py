@@ -21,6 +21,24 @@ ENERGY_TORQUE_WEIGHT = -0.7  # was -0.35 (R3)
 IMPACT_IMPULSE_WEIGHT = -0.3
 IMPACT_WINDOW_S = 0.04  # the Energy reward spike sits at 10-20 ms after touchdown; 40 ms holds it at 1-2 m/s
 IMPACT_MIN_AIR_S = 0.04  # shorter gaps are sole flicker inside one stance, not a touchdown
+# PACE power cost (2026-10-13, back from the torque^2 term): same numbers as the 09-23 Energy reward run.
+# k_el (with its 1/3 scale assumption) lives with the robot asset so the reward and the energy/elec_*
+# metrics use the same numbers.
+PACE_K_EL = UNITREE_G1_29DOF_K_EL
+PACE_K_REGEN = 0.0  # per-motor braking work recovered at this efficiency; 0 = dissipated (no regen path on the G1)
+PACE_SPEED_EXPONENT = 1.0  # gamma = 1 / (|v_cmd|^p + 1); paper p = 2, 1 keeps the high-speed pressure
+PACE_ENERGY_WEIGHT = -5e-3  # per Watt (after gamma); ~25% of positive reward at 2 m/s
+# Peak ground reaction force (2026-10-13, replaces the landing impulse): per policy step, each foot's
+# largest |F| over the 4 physics substeps above FOOT_FORCE_THRESHOLD, summed over feet [N]. No time
+# window, so loading cannot be deferred past it (the impulse run touched down softly for 40 ms and
+# loaded afterwards: 40 ms peak -58%, stance peak only -4%). Running stance peaks are 2.2-2.6 BW, so
+# 1.8 BW presses on the top of every stance without touching the ~1.4 BW support level a 30% flight
+# gait needs. Weight: ~20-30 N mean violation per step expected -> ~-0.3..-0.45 of Episode_Reward,
+# the share feet_impact (-0.4) had; recalibrate from Episode_Reward/feet_force after the gate opens.
+G1_BODY_WEIGHT_N = 33.34 * 9.81
+FOOT_FORCE_THRESHOLD_BW = 2.0
+FOOT_FORCE_THRESHOLD_N = FOOT_FORCE_THRESHOLD_BW * G1_BODY_WEIGHT_N  # ~589 N
+FOOT_FORCE_WEIGHT = -1.5e-2  # per N of violation
 STAND_EP_LEN = 500.0  # steps; half the 1000-step episode. Falling runs sit at 50-130.
 STAND_RAMP_ITERS = 500
 
@@ -40,32 +58,34 @@ def _gate(term_name: str, end_weight: float) -> CurrTerm:
 
 @configclass
 class RewardsCfg(BaseRewardsCfg):
-    """Baseline reward terms plus normalized tau^2 and the landing impulse (weights set by the gate).
+    """Baseline reward terms plus the PACE power cost and a peak-GRF penalty (weights set by the gate).
 
-    2026-10-12: the mechanical-power term (joint_power, ME) is dropped and the landing impulse added,
-    so the pair under test is "torque squared + contact impulse". The 09-28 Reward run (joint_power +
-    joint_torque) stays reproducible from its params/ copy.
+    2026-10-13: the pair under test is "PACE power + peak contact force". The 10-12 run (torque^2 +
+    landing impulse, params/ copy in logs/.../2026-10-12_18-56-43_torque) cut the 40 ms landing impulse
+    by ~75% but left the stance peak at -4% and did not lower mechanical work at all; the 09-28 Reward
+    run (joint_power + joint_torque) and the 09-23 Energy reward run (PACE only) keep their params/ copies.
+    Both terms start at 0 -- RewardManager skips zero-weight terms, so before the gate opens this is
+    bit-identical to the baseline objective.
     """
 
-    # joint_torque is the I^2 R share of the electrical cost, normalized by effort limit so one
-    # weight covers the 25 Nm ankles and the 139 Nm knees alike.
-    # Both terms start at 0 -- RewardManager skips zero-weight terms, so before the gate opens this
-    # is bit-identical to the baseline objective.
-    # joint_power = RewTerm(
-    #     func=mdp.joint_power_l1,
-    #     weight=0.0,
-    #     params={"power_ref": ENERGY_POWER_REF_W},
-    # )
-    joint_torque = RewTerm(func=mdp.joint_torque_normalized_l2, weight=0.0)
-    # Landing impulse int |F| dt over the first IMPACT_WINDOW_S of each stance; needs the contact
-    # sensor history widened to one policy step (RobotEnvCfg.__post_init__).
-    feet_impact = RewTerm(
-        func=mdp.feet_impact_impulse,
+    joint_energy_pace = RewTerm(
+        func=mdp.pace_energy_cost,
         weight=0.0,
         params={
+            "k_el": PACE_K_EL,
+            "k_regen": PACE_K_REGEN,
+            "include_potential": False,
+            "speed_exponent": PACE_SPEED_EXPONENT,
+        },
+    )
+    # Isaac Lab's contact_forces: max over the sensor history (one policy step of substeps, see
+    # RobotEnvCfg.__post_init__) of |F| per foot, minus the threshold, clipped at 0, summed over feet.
+    feet_force = RewTerm(
+        func=mdp.contact_forces,
+        weight=0.0,
+        params={
+            "threshold": FOOT_FORCE_THRESHOLD_N,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=GAIT_FEET_BODY_NAMES),
-            "window_s": IMPACT_WINDOW_S,
-            "min_air_s": IMPACT_MIN_AIR_S,
         },
     )
 
@@ -74,9 +94,8 @@ class RewardsCfg(BaseRewardsCfg):
 class CurriculumCfg(BaseCurriculumCfg):
     """Baseline curriculum plus the standing gate for the two cost terms."""
 
-    # joint_power_weight = _gate("joint_power", ENERGY_POWER_WEIGHT)
-    joint_torque_weight = _gate("joint_torque", ENERGY_TORQUE_WEIGHT)
-    feet_impact_weight = _gate("feet_impact", IMPACT_IMPULSE_WEIGHT)
+    joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
+    feet_force_weight = _gate("feet_force", FOOT_FORCE_WEIGHT)
 
 
 @configclass
@@ -86,7 +105,7 @@ class RobotEnvCfg(BaseRobotEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # One policy step of force samples (3 -> 4 substeps) so feet_impact integrates every substep.
+        # One policy step of force samples (3 -> 4 substeps) so feet_force sees the peak at every substep.
         # Observations do not read the history; undesired_contacts sees one more substep in its max.
         self.scene.contact_forces.history_length = self.decimation
 

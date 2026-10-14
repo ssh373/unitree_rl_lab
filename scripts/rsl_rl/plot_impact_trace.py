@@ -159,11 +159,12 @@ def main():
         print(f"[INFO] wrote {args.csv}")
 
     # ---- figure ----
-    fig = plt.figure(figsize=(13, 9), facecolor="white")
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 1], hspace=0.38, wspace=0.22)
+    ncol = max(len(runs), 2)
+    fig = plt.figure(figsize=(6.5 * ncol, 9), facecolor="white")
+    gs = fig.add_gridspec(2, ncol, height_ratios=[1.15, 1], hspace=0.38, wspace=0.22)
     axes_top = [fig.add_subplot(gs[0, i]) for i in range(len(runs))]
-    ax_mean = fig.add_subplot(gs[1, 0])
-    ax_J = fig.add_subplot(gs[1, 1])
+    ax_mean = fig.add_subplot(gs[1, : ncol // 2])
+    ax_J = fig.add_subplot(gs[1, ncol // 2 :])
     rng = np.random.default_rng(0)
     ymax = max(np.percentile(r["fz"].max(axis=1) / r["bw"], 98) for _, r in runs) * 1.08
 
@@ -202,13 +203,14 @@ def main():
     ax_mean.legend(loc="upper right", frameon=False, fontsize=9)
 
     # impulse vs window
-    for (label, r), c in zip(runs, COLORS):
+    label_offsets = [-14, 9, -14, 9]
+    for k, ((label, r), c) in enumerate(zip(runs, COLORS)):
         means = [r["J"][w].mean() for w in WINDOWS_MS]
         sds = [r["J"][w].std() for w in WINDOWS_MS]
         ax_J.errorbar(WINDOWS_MS, means, yerr=sds, color=c, lw=2, marker="o", ms=8, mec="white", mew=1.5,
                       capsize=3, label=label)
         for w, m in zip(WINDOWS_MS, means):
-            ax_J.annotate(f"{m:.1f}", (w, m), xytext=(0, 9 if c == COLORS[1] else -14), textcoords="offset points",
+            ax_J.annotate(f"{m:.1f}", (w, m), xytext=(0, label_offsets[k]), textcoords="offset points",
                           ha="center", fontsize=8.5, color=INK)
     ax_J.set_xticks(WINDOWS_MS); ax_J.set_xlim(12, 88)
     ax_J.set_title("착지 충격량 ∫|F|dt 와 적분 창 길이 (평균 ± 표준편차)", fontsize=11, color=INK, loc="left")

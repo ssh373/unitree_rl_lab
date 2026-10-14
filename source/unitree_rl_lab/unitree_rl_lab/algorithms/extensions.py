@@ -4,7 +4,8 @@ rsl_rl's :class:`~rsl_rl.algorithms.ppo.PPO` has exactly two places where an aux
 plug in without rewriting the update loop: the reward it records for a transition
 (:meth:`process_env_step`) and what happens after a policy update (:meth:`update`). AMP needs
 only those two -- its style reward is added to the task reward and its discriminator trains on
-its own optimizer -- and so does a penalty-style constraint. Modelling each as a
+its own optimizer -- and so does a penalty-style constraint (the Lagrangian cost penalty in
+:mod:`unitree_rl_lab.algorithms.constraints`). Modelling each as a
 :class:`PPOExtension` lets several of them run side by side as a list instead of a chain of
 subclasses, and keeps PPO's own loss computation untouched so upstream changes to rsl_rl keep
 working.
@@ -54,18 +55,30 @@ class ExtendedPPO(PPO):
     """PPO plus a list of :class:`PPOExtension`.
 
     ``extensions`` is a list of already constructed extension objects. The class also accepts
-    ``amp_cfg`` for convenience -- a dictionary from the agent configuration -- and builds an
-    :class:`~unitree_rl_lab.algorithms.amp.extension.AMPExtension` from it, mirroring how PPO
-    accepts ``rnd_cfg``.
+    ``amp_cfg`` and ``constraint_cfg`` for convenience -- dictionaries from the agent configuration --
+    and builds an :class:`~unitree_rl_lab.algorithms.amp.extension.AMPExtension` /
+    :class:`~unitree_rl_lab.algorithms.constraints.extension.LagrangianPenaltyExtension` from them,
+    mirroring how PPO accepts ``rnd_cfg``.
     """
 
-    def __init__(self, *args, extensions: list[PPOExtension] | None = None, amp_cfg: dict | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        extensions: list[PPOExtension] | None = None,
+        amp_cfg: dict | None = None,
+        constraint_cfg: dict | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.extensions: list[PPOExtension] = list(extensions or [])
         if amp_cfg is not None:
             from unitree_rl_lab.algorithms.amp.extension import AMPExtension
 
             self.extensions.append(AMPExtension(device=self.device, **amp_cfg))
+        if constraint_cfg is not None:
+            from unitree_rl_lab.algorithms.constraints.extension import LagrangianPenaltyExtension
+
+            self.extensions.append(LagrangianPenaltyExtension(device=self.device, **constraint_cfg))
 
     # -- rollout ------------------------------------------------------------------------------
 

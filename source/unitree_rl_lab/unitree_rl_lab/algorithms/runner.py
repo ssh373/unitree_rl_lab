@@ -42,9 +42,10 @@ class ExtendedOnPolicyRunner(OnPolicyRunner):
 
         # Extensions that read the environment (default joint state, command manager) get it here,
         # the way resolve_symmetry_config injects it for the symmetry augmentation.
-        amp_cfg = self.alg_cfg.get("amp_cfg")
-        if amp_cfg is not None:
-            amp_cfg["_env"] = self.env
+        for cfg_key in ("amp_cfg", "constraint_cfg"):
+            ext_cfg = self.alg_cfg.get(cfg_key)
+            if ext_cfg is not None:
+                ext_cfg["_env"] = self.env
 
         policy_class_name = self.policy_cfg.pop("class_name")
         try:

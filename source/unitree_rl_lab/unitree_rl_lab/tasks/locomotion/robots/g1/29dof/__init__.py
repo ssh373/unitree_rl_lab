@@ -73,3 +73,17 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningAmpPPORunnerCfg",
     },
 )
+
+# Constrained RL (Kim et al. 2024 style): rewards keep only alive, the energy term and the clock-based gait
+# terms; command tracking and every other penalty are constraints (ConstraintsCfg in the env cfg) solved
+# by a per-term Lagrangian multiplier in the ExtendedPPO extension list.
+gym.register(
+    id="Unitree-G1-29dof-Running-Constrained",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.running_constrained_env_cfg:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.running_constrained_env_cfg:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningConstrainedPPORunnerCfg",
+    },
+)

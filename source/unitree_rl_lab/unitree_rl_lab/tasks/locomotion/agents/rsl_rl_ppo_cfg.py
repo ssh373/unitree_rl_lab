@@ -125,12 +125,36 @@ class RslRlAmpCfg:
     use_symmetry_augmentation: bool = True
 
 
+# Lagrangian constraint solver (2026-10-14). *What* is constrained and by how much lives in the task's
+# ConstraintsCfg (env cfg, next to the rewards); only the multiplier dynamics are set here. Costs reach
+# the penalty divided by their bound, so lambda is comparable across terms: lambda = 1 charges one
+# reward-weight unit per "one bound's worth" of cost (the baseline's penalty weights span 0.05-10).
+CONSTRAINT_LAMBDA_LR = 1.0e-2  # per iteration per unit of relative violation; 30% over -> +3e-3/iter, lambda 1 in ~330 iters
+CONSTRAINT_LAMBDA_MAX = 10.0  # default cap; a ConstraintTermCfg.lambda_max overrides it per term
+CONSTRAINT_VIOLATION_CLIP = 1.0  # dual step uses clip(J-1, -1, 1): a multiplier moves at most lr per iteration
+
+
+@configclass
+class RslRlConstraintCfg:
+    """Lagrangian solver settings, consumed by
+    :class:`unitree_rl_lab.algorithms.constraints.extension.LagrangianPenaltyExtension`."""
+
+    lambda_lr: float = CONSTRAINT_LAMBDA_LR
+    lambda_max: float = CONSTRAINT_LAMBDA_MAX
+    violation_clip: float | None = CONSTRAINT_VIOLATION_CLIP
+    """Clip the relative violation to +-this before the dual step (None: no clip); see the extension."""
+    start_after_standing: bool = True
+    """Hold the gated multipliers at their lambda_init until the policy stands (same test as the reward gate)."""
+    ep_len_threshold: float = 500.0
+
+
 @configclass
 class RslRlExtendedPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """PPO algorithm configuration with composable extensions (see ``unitree_rl_lab.algorithms``)."""
 
     class_name: str = "ExtendedPPO"
     amp_cfg: RslRlAmpCfg | None = None
+    constraint_cfg: RslRlConstraintCfg | None = None
 
 
 _LAFAN1_RUN_DIR = os.path.join(
@@ -221,4 +245,32 @@ class RunningAmpPPORunnerCfg(RunningPPORunnerCfg):
         # Single clip (user decision 2026-09-23): run1_subject5, the cleanest take. Low-speed coverage is
         # thin (5% below 0.6 m/s), so speed-matched sampling falls back to nearest neighbours there.
         # amp_cfg=RslRlAmpCfg(motion_files=LAFAN1_RUN_SINGLE_CLIP),
+    )
+
+
+@configclass
+class RunningConstrainedPPORunnerCfg(RunningPPORunnerCfg):
+    """Constrained running task: task rewards + energy reward, every other penalty as a constraint
+    (see running_constrained_env_cfg.py); this cfg only sets the multiplier dynamics."""
+
+    class_name: str = "ExtendedOnPolicyRunner"
+    algorithm = RslRlExtendedPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=False,
+            data_augmentation_func=compute_g1_29dof_symmetric_states,
+        ),
+        constraint_cfg=RslRlConstraintCfg(),
     )

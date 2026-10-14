@@ -54,6 +54,53 @@ def lin_vel_cmd_levels(
     return torch.tensor(ranges.lin_vel_x[1], device=env.device)
 
 
+def lin_vel_cmd_levels_from_metric(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    metric_name: str = "velocity/track_xy_kernel",
+    threshold: float = 0.8,
+    ang_vel_delta: float = 0.0,
+) -> torch.Tensor:
+    """:func:`lin_vel_cmd_levels` for tasks where tracking is a constraint, not a reward.
+
+    Same levels, same gate: the baseline opens a level when the ``track_lin_vel_xy`` reward clears 80% of
+    its weight, i.e. when the per-episode mean of its exp kernel exceeds 0.8. Here that kernel mean is read
+    from the command term's ``velocity/track_xy_kernel`` metric (``track_kernel_std`` must be set on the
+    command cfg), so the gate is unchanged while the reward term is gone.
+    """
+    command_term = env.command_manager.get_term("base_velocity")
+    ranges = command_term.cfg.ranges
+    limit_ranges = command_term.cfg.limit_ranges
+    if metric_name not in command_term.metrics:
+        raise ValueError(
+            f"Command term metric '{metric_name}' not found; set track_kernel_std on the base_velocity command cfg."
+        )
+    kernel = torch.mean(command_term.metrics[metric_name][env_ids])
+
+    if env.common_step_counter % env.max_episode_length == 0:
+        if kernel > threshold:
+            delta_command = torch.tensor([-0.1, 0.1], device=env.device)
+            ranges.lin_vel_x = torch.clamp(
+                torch.tensor(ranges.lin_vel_x, device=env.device) + delta_command,
+                limit_ranges.lin_vel_x[0],
+                limit_ranges.lin_vel_x[1],
+            ).tolist()
+            ranges.lin_vel_y = torch.clamp(
+                torch.tensor(ranges.lin_vel_y, device=env.device) + delta_command,
+                limit_ranges.lin_vel_y[0],
+                limit_ranges.lin_vel_y[1],
+            ).tolist()
+            if ang_vel_delta > 0.0:
+                delta_ang = torch.tensor([-ang_vel_delta, ang_vel_delta], device=env.device)
+                ranges.ang_vel_z = torch.clamp(
+                    torch.tensor(ranges.ang_vel_z, device=env.device) + delta_ang,
+                    limit_ranges.ang_vel_z[0],
+                    limit_ranges.ang_vel_z[1],
+                ).tolist()
+
+    return torch.tensor(ranges.lin_vel_x[1], device=env.device)
+
+
 def ang_vel_z_cmd_range(env: ManagerBasedRLEnv, env_ids: Sequence[int]) -> torch.Tensor:
     """Log-only term: the current upper bound of the ang_vel_z command range.
 
