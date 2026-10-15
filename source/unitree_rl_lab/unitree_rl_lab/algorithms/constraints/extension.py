@@ -7,14 +7,26 @@ are already divided by their bound. Its Lagrangian relaxation is solved RCPO-sty
 
     r' = r - step_dt * sum_k lambda_k * c_k
 
-and after every PPO update each multiplier takes a dual-ascent step on its rollout-mean violation
+and after every PPO update each multiplier takes a dual-ascent step on its rollout-mean violation,
+either additive or (default) multiplicative:
 
-    lambda_k <- clip(lambda_k + lr * (J_{c_k} - 1), 0, lambda_max_k).
+    additive:        lambda_k <- clip(lambda_k + lr * v_k, 0, cap_k)
+    multiplicative:  lambda_k <- min(lambda_k * exp(lr * v_k), cap_k),   v_k = clip(J_{c_k} - 1, -clip, clip)
 
 A multiplier therefore rises while its constraint is violated and decays back once it is satisfied, so
 the penalty weights are set by the bounds instead of by hand. ``lambda`` is in reward-weight units (it is
 multiplied by ``step_dt`` the way Isaac Lab's RewardManager multiplies every weight) and acts on the
 bound-normalized cost, so ``lambda = 1`` charges one reward unit per "one bound's worth" of cost.
+
+Why multiplicative (2026-10-14): the bound-normalized costs of different terms sit on scales that differ
+by orders of magnitude, and so do the multipliers that match the baseline's hand-tuned weights
+(``lambda = weight * bound`` is 0.005-0.13 for the G1 running penalties). An additive step moves every
+violated term by the same absolute amount, which is 10-200x the baseline weight within a few iterations;
+a relative step keeps the baseline's weight ratios and lets only the violated terms grow, by at most
+``exp(lr)`` per iteration. With the multiplicative rule a term initialized at 0 stays at 0, so every
+term needs a positive ``lambda_init`` (``running_constrained_env_cfg.py`` derives them from the baseline
+weights). The per-term cap defaults to ``lambda_max_ratio * lambda_init``: a multiplier sitting at its cap
+says the bound is infeasible for this policy.
 
 Compared with IPO (the paper's solver) there is no cost critic and no barrier: the per-state information
 still reaches the policy because the cost enters the per-step reward; only the *weight* comes from a
@@ -52,6 +64,8 @@ class LagrangianPenaltyExtension(PPOExtension):
         *,
         lambda_lr: float = 1.0e-2,
         lambda_max: float = 10.0,
+        lambda_max_ratio: float | None = None,
+        update_rule: str = "additive",
         violation_clip: float | None = None,
         start_after_standing: bool = True,
         ep_len_threshold: float = 500.0,
@@ -62,6 +76,9 @@ class LagrangianPenaltyExtension(PPOExtension):
         Args:
             lambda_lr: Dual step per PPO iteration per unit of relative violation ``J_c - 1``.
             lambda_max: Default cap on every multiplier; a term's ``lambda_max`` overrides it.
+            lambda_max_ratio: If set, a term's cap is ``ratio * lambda_init`` (when its ``lambda_init`` > 0 and
+                it has no explicit ``lambda_max``); ``lambda_max`` then only applies to terms starting at 0.
+            update_rule: ``"additive"`` or ``"multiplicative"`` dual step (see the module docstring).
             violation_clip: If set, the relative violation is clipped to ``[-clip, clip]`` before the dual
                 step, so a multiplier moves by at most ``lr * clip`` per iteration. Costs are unbounded
                 above (a random policy's yaw error is 40x its bound) and without the clip the early
@@ -72,6 +89,9 @@ class LagrangianPenaltyExtension(PPOExtension):
         """
         if _env is None:
             raise RuntimeError("LagrangianPenaltyExtension needs the environment (injected by ExtendedOnPolicyRunner).")
+        if update_rule not in ("additive", "multiplicative"):
+            raise ValueError(f"update_rule must be 'additive' or 'multiplicative', got {update_rule!r}.")
+        self.update_rule = update_rule
         self.lambda_lr = float(lambda_lr)
         self.violation_clip = None if violation_clip is None else float(violation_clip)
         self.start_after_standing = start_after_standing
@@ -98,9 +118,18 @@ class LagrangianPenaltyExtension(PPOExtension):
         num_terms = len(self.term_names)
 
         self.lmbda = manager.lambda_init.detach().clone().float().to(device)
-        self.lambda_max = torch.tensor(
-            [lambda_max if m is None else float(m) for m in manager.lambda_max], dtype=torch.float, device=device
-        )
+        caps = []
+        for init, explicit in zip(self.lmbda.tolist(), manager.lambda_max):
+            if explicit is not None:
+                caps.append(float(explicit))
+            elif lambda_max_ratio is not None and init > 0.0:
+                caps.append(float(lambda_max_ratio) * init)
+            else:
+                caps.append(float(lambda_max))
+        self.lambda_max = torch.tensor(caps, dtype=torch.float, device=device)
+        if update_rule == "multiplicative" and bool((self.lmbda <= 0.0).any()):
+            zero = [n for n, v in zip(self.term_names, self.lmbda.tolist()) if v <= 0.0]
+            print(f"[LagrangianPenaltyExtension] multiplicative update: terms starting at 0 stay at 0: {zero}")
         self.gated = manager.gated.to(device)
         self.is_prob = manager.is_prob.to(device)
 
@@ -187,10 +216,14 @@ class LagrangianPenaltyExtension(PPOExtension):
             if self.is_prob[k]:
                 logs[f"constraint/{name}/viol_prob"] = (cost_mean[k] * self.manager.bounds[k]).item()
             logs[f"constraint/{name}/raw_mean"] = raw_mean[k].item()
+            logs[f"constraint/{name}/lambda_frac_of_cap"] = (self.lmbda[k] / self.lambda_max[k]).item()
 
         active = (~self.gated) | self.gate_open
         step = violation if self.violation_clip is None else violation.clamp(-self.violation_clip, self.violation_clip)
-        new_lmbda = (self.lmbda + self.lambda_lr * step).clamp(min=0.0)
+        if self.update_rule == "multiplicative":
+            new_lmbda = self.lmbda * torch.exp(self.lambda_lr * step)
+        else:
+            new_lmbda = (self.lmbda + self.lambda_lr * step).clamp(min=0.0)
         new_lmbda = torch.minimum(new_lmbda, self.lambda_max)
         self.lmbda = torch.where(active, new_lmbda, self.lmbda)
 

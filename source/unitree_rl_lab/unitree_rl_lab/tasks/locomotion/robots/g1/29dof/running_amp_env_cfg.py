@@ -115,7 +115,7 @@ WRIST_DEVIATION_WEIGHT = -0.5  # same as joint_deviation_arm_lateral in the base
 # Reference state initialisation (AMP paper): the fraction of resets that start from a reference frame.
 # The clip list must match the discriminator's (RunningAmpPPORunnerCfg.algorithm.amp_cfg) so the policy
 # only starts from states the discriminator rewards. 0.8 keeps 20% default-pose starts for robustness.
-RSI_PROBABILITY = 0.8
+RSI_PROBABILITY = 0.0  # 2026-10-15: RSI off -- the retargeted frames are not dynamically feasible, amp_edit never stood (0.8); amp_edit_noRSI stood at 13k
 
 
 @configclass

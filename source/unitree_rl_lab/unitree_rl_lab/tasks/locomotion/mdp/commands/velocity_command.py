@@ -4,12 +4,6 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 
 import torch
-from isaaclab.utils.math import yaw_quat
-
-try:
-    from isaaclab.utils.math import quat_apply_inverse
-except ImportError:
-    from isaaclab.utils.math import quat_rotate_inverse as quat_apply_inverse
 
 from isaaclab.envs.mdp import UniformVelocityCommand, UniformVelocityCommandCfg
 from isaaclab.sensors import ContactSensor
@@ -48,12 +42,6 @@ class LoggedUniformLevelVelocityCommand(UniformVelocityCommand):
         self._cot_pos_energy_j = torch.zeros(self.num_envs, device=self.device)
         self._cot_distance_m = torch.zeros(self.num_envs, device=self.device)
         self._k_el: torch.Tensor | None = None
-        if self.cfg.track_kernel_std is not None:
-            # Per-episode mean of exp(-|v_cmd - v_yaw|^2 / std^2), the baseline's track_lin_vel_xy reward
-            # kernel without its weight, so a curriculum can keep the baseline's gate when tracking is a
-            # constraint rather than a reward (mdp.lin_vel_cmd_levels_from_metric).
-            self.metrics["velocity/track_xy_kernel"] = torch.zeros(self.num_envs, device=self.device)
-
         if self.cfg.log_energy_metrics:
             # Weight in Newton, used to make the cost of transport dimensionless.
             self._robot_weight_n = self.robot.data.default_mass.sum(dim=1).to(self.device) * 9.81
@@ -157,11 +145,6 @@ class LoggedUniformLevelVelocityCommand(UniformVelocityCommand):
             self._update_running_mean("velocity/actual_abs_x_mps", torch.abs(actual_xy[:, 0]))
             self._update_running_mean("velocity/error_xy_mps", torch.linalg.norm(command_xy - actual_xy, dim=-1))
 
-        if self.cfg.track_kernel_std is not None:
-            vel_yaw = quat_apply_inverse(yaw_quat(self.robot.data.root_quat_w), self.robot.data.root_lin_vel_w[:, :3])
-            err_sq = torch.sum(torch.square(self.vel_command_b[:, :2] - vel_yaw[:, :2]), dim=1)
-            self._update_running_mean("velocity/track_xy_kernel", torch.exp(-err_sq / self.cfg.track_kernel_std**2))
-
         if self.cfg.log_energy_metrics:
             torque = self.robot.data.applied_torque
             # Per-motor positive (motoring) work: E_mech rate, and the quantity the joint_power
@@ -242,9 +225,6 @@ class LoggedUniformLevelVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     class_type: type = LoggedUniformLevelVelocityCommand
 
     log_tracking_metrics: bool = False
-    track_kernel_std: float | None = None
-    """When set, logs ``velocity/track_xy_kernel``: the per-episode mean of the baseline's tracking reward
-    kernel ``exp(-|v_cmd - v|^2 / std^2)`` (yaw frame). Read by ``lin_vel_cmd_levels_from_metric``."""
     log_energy_metrics: bool = False
     cot_min_speed: float = 0.3
     joule_coefficients: dict[str, float] | None = None

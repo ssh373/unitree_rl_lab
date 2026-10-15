@@ -3,34 +3,42 @@ Constraints", T-RO 2024), for the energy-efficiency study.
 
 Objective = minimize energy subject to baseline-level behaviour:
 
-* **Rewards** keep ``alive``, the clock-based gait terms (``run_contact_pattern``, ``push_off``,
-  ``short_contact``, ``stand_feet_contact`` -- left as rewards for now, 2026-10-14) and the PACE power
-  cost with a fixed weight (energy is to be *minimized*, so it is a reward, not a bounded constraint).
-* **Constraints** (:class:`ConstraintsCfg`) take over command tracking and every other baseline penalty.
-  Tracking is a constraint rather than a reward so the energy/performance trade-off is fixed by a bound
-  ("tracking error no worse than baseline") instead of a weight ratio.
+* **Rewards** keep the baseline's task terms -- command tracking (exp kernels, weight 2.0) and ``alive`` --
+  the clock-based gait terms (``run_contact_pattern``, ``push_off``, ``short_contact``,
+  ``stand_feet_contact``; left as rewards for now, 2026-10-14) and the PACE power cost with a fixed weight
+  (energy is to be *minimized*, so it is a reward, not a bounded constraint).
+* **Constraints** (:class:`ConstraintsCfg`) take over every other baseline penalty, plus two *guard*
+  constraints on the tracking error (gated, ``lambda_init = 0``): they do nothing until the energy reward
+  erodes tracking below the baseline's mean error, and then push back. The energy/performance trade-off is
+  therefore pinned by a bound, not by the weight ratio, while the tracking reward keeps the per-step return
+  positive. The first attempt (2026-10-14 run ``17-49-26_constrained``) had tracking *only* as constraints:
+  with no positive reward left, the policy learned to terminate within 3 steps (flipping itself over) and
+  the multipliers ran away -- a penalty can punish, it cannot give a reason to stay alive.
 
 Thresholds (set 2026-10-14) come from the baseline policy's per-step statistics
 (``scripts/rsl_rl/measure_constraint_stats.py``, run 2026-09-15_10-44-43_baseline model_29999, 1024 envs x
 1500 steps, training command distribution incl. 10% standing, flat ground;
 ``logs/constraint_stats_baseline_29999.csv``): ``mean`` terms get ``bound = baseline mean`` exactly (no
-slack, user decision), ``prob`` terms get ``limit = baseline p97.5`` with the paper's 2.5% allowance for
-every prob term (also for dof_pos_limits / undesired_contacts, which the baseline violates far less often --
-user decision). Yaw tracking is the one bound set *tighter* than baseline (0.08 rad/s vs. the measured
+slack, user decision); the two ``prob`` terms (joint limits, non-foot contact) use limit 0 with the paper's
+2.5% allowance (user decision). 2026-10-15: ang_vel_xy, flat_orientation and the joint-limit excess became
+mean terms after run ``18-57-49`` never stood with them as indicators (no gradient, 30x too weak at the
+limits); the joint-limit indicator stays as a second, specification-style constraint on the same quantity. Yaw tracking is the one bound set *tighter* than baseline (0.08 rad/s vs. the measured
 0.31): the user wants yaw tracked about as well as x. If a bound is infeasible its multiplier sits at the cap:
 watch ``Loss/constraint/track_ang_vel_z/lambda`` (bounds can be changed and the run resumed; multipliers are
 checkpointed by name).
 
-The tracking multipliers start at the value where the penalty's gradient d(lambda * dt * e / bound)/de
-matches the baseline kernel reward's gradient near its operating point (e ~ 0.1): lin 0.3, yaw 1.0
-(2026-10-14; 2.0 made the initial yaw penalty 40x the baseline's tracking signal). Together with the
-solver's ``violation_clip = 1.0`` (lambda moves at most lr per iteration) this keeps the early penalty on
-the scale of the rewards; the slow multiplier growth is the implicit curriculum.
+Multipliers start at the **baseline-equivalent weight**: the penalty ``lambda * c / bound`` equals the
+baseline's ``weight * f`` when ``lambda = weight * bound`` (mean terms), so before the standing gate opens
+the objective is the baseline's, with the gait and energy terms as above. For the prob terms the indicator
+costs ``1 / allowance = 40`` per violating step, so ``lambda = baseline penalty per violating step * allowance``.
+The tracking guards have no baseline counterpart and start small. From there the solver moves each
+multiplier *multiplicatively* (1% per iteration of clipped violation, cap 10x its start), so the baseline's
+weight ratios are kept and only the violated terms grow. Run ``18-31-38`` (all terms from 0, additive
+0.01/iter, cap 2) had every multiplier at 1.14 = 10-200x the baseline weights 100 iterations after the gate
+opened, penalty 7.6/step, and collapsed.
 
 The baseline cfg is untouched; this module only overrides terms.
 """
-
-import math
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -69,21 +77,44 @@ DEV_ARM_LATERAL_BOUND = 0.130  # rad shoulder roll/yaw, wrists             basel
 DEV_WAIST_BOUND = 0.0414  # rad waist                                      baseline 0.04144
 DEV_LEGS_BOUND = 0.130  # rad hip roll/yaw                                 baseline 0.1296
 FEET_SLIDE_BOUND = 0.0558  # m/s mean foot speed in contact                baseline 0.05582
-# prob terms: limit = baseline p97.5 (or 0 where the baseline is at 0 for >97.5% of steps)
-ANG_VEL_XY_LIMIT = 0.91  # (rad/s)^2 |w_xy|^2 per step          baseline p97.5 0.9104
-FLAT_ORIENTATION_LIMIT = 0.0101  # gravity xy^2 per step        baseline p97.5 0.01008 (~5.8 deg tilt)
+# posture-shaping terms as mean constraints (2026-10-15): run 18-57-49 never stood with these as prob
+# indicators -- an indicator has no gradient and, with the baseline-equivalent multiplier, charged 30x less
+# than the baseline's continuous penalty while the policy sat at the joint limits (97.5% of steps).
+ANG_VEL_XY_BOUND = 0.246  # (rad/s)^2 mean |w_xy|^2                baseline 0.2464
+FLAT_ORIENTATION_BOUND = 0.00289  # mean gravity xy^2               baseline 0.002891
+DOF_POS_EXCESS_BOUND = 0.000119  # rad mean soft-limit excess       baseline 0.0001189
+# prob terms: limit 0 where the baseline is at 0 for >97.5% of steps
 DOF_POS_LIMIT = 0.0  # rad; any soft-limit excess is a violation  baseline violates 0.4% of steps
 UNDESIRED_CONTACT_LIMIT = 0.0  # count; any non-foot contact      baseline violates ~0% of steps
-TRACK_LIN_LAMBDA_INIT = 0.3  # gradient-matched to the baseline's track_lin_vel_xy kernel (std sqrt(0.1)) near e ~ 0.1 m/s
-TRACK_ANG_LAMBDA_INIT = 1.0  # same for track_ang_vel_z (std 0.2) near e ~ 0.1 rad/s; both ungated
+
+# -- initial multipliers: baseline weight x bound (mean), baseline penalty per violating step x allowance (prob) --
+def _lam(weight: float, bound: float) -> float:
+    return weight * bound
+
+
+LAMBDA_TRACK_GUARD = 0.005  # no baseline counterpart; ~0.0006/step at 6x bound, negligible until it grows
+LAMBDA_LIN_VEL_Z = _lam(0.05, LIN_VEL_Z_BOUND)  # 0.006
+LAMBDA_BASE_HEIGHT = _lam(10.0, BASE_HEIGHT_BOUND)  # 0.024
+LAMBDA_JOINT_VEL = _lam(0.001, JOINT_VEL_BOUND)  # 0.057
+LAMBDA_JOINT_ACC = _lam(2.5e-7, JOINT_ACC_BOUND)  # 0.035
+LAMBDA_ACTION_RATE = _lam(0.05, ACTION_RATE_BOUND)  # 0.060
+LAMBDA_DEV_ARM_SWING = _lam(0.02, DEV_ARM_SWING_BOUND)  # 0.016
+LAMBDA_DEV_ARM_LATERAL = _lam(0.5, DEV_ARM_LATERAL_BOUND)  # 0.065
+LAMBDA_DEV_WAIST = _lam(1.0, DEV_WAIST_BOUND)  # 0.041
+LAMBDA_DEV_LEGS = _lam(1.0, DEV_LEGS_BOUND)  # 0.130
+LAMBDA_FEET_SLIDE = _lam(0.2, FEET_SLIDE_BOUND)  # 0.011
+LAMBDA_ANG_VEL_XY = _lam(0.05, ANG_VEL_XY_BOUND)  # 0.0123
+LAMBDA_FLAT_ORIENTATION = _lam(2.0, FLAT_ORIENTATION_BOUND)  # 0.0058
+LAMBDA_DOF_POS_EXCESS = _lam(5.0, DOF_POS_EXCESS_BOUND)  # 0.0006
+LAMBDA_DOF_POS_LIMITS = 5.0 * 0.01 * PROB_ALLOWANCE  # prob guard: baseline 5.0 * excess ~ 0.01 rad per violating step -> 0.00125
+LAMBDA_UNDESIRED_CONTACTS = 1.0 * 1.0 * PROB_ALLOWANCE  # baseline 1.0 per contacting body -> 0.025
+
 
 
 @configclass
 class RewardsCfg(BaseRewardsCfg):
-    """alive + gait clock terms + energy. Everything else moved to :class:`ConstraintsCfg`."""
+    """Tracking + alive + gait clock terms + energy. Every penalty moved to :class:`ConstraintsCfg`."""
 
-    track_lin_vel_xy = None
-    track_ang_vel_z = None
     base_linear_velocity = None
     base_angular_velocity = None
     joint_vel = None
@@ -114,51 +145,66 @@ class RewardsCfg(BaseRewardsCfg):
 
 @configclass
 class ConstraintsCfg:
-    """Read by :class:`mdp.constraints.ConstraintManager`; ``mean``: E[f] <= bound, ``prob``: P(f > limit) <= bound."""
+    """Read by :class:`mdp.constraints.ConstraintManager`; ``mean``: E[f] <= bound, ``prob``: P(f > limit) <= bound.
+    All terms are gated (multipliers hold their baseline-equivalent start until the policy stands)."""
 
-    # -- task performance: not gated, so the policy has a reason to move from the first iteration
+    # -- task performance guards: the tracking *reward* drives tracking; these only act once the energy
+    # term pushes the error above the baseline's level (gated, start at 0 like every other constraint)
     track_lin_vel_xy = ConTerm(
         func=mdp.track_lin_vel_xy_error,
         kind="mean",
         bound=TRACK_LIN_VEL_BOUND,
-        lambda_init=TRACK_LIN_LAMBDA_INIT,
-        gated=False,
+        lambda_init=LAMBDA_TRACK_GUARD,
         params={"command_name": "base_velocity"},
     )
     track_ang_vel_z = ConTerm(
         func=mdp.track_ang_vel_z_error,
         kind="mean",
         bound=TRACK_ANG_VEL_BOUND,
-        lambda_init=TRACK_ANG_LAMBDA_INIT,
-        gated=False,
+        lambda_init=LAMBDA_TRACK_GUARD,
         params={"command_name": "base_velocity"},
     )
 
     # -- base
-    lin_vel_z = ConTerm(func=mdp.lin_vel_z_l2, kind="mean", bound=LIN_VEL_Z_BOUND)
-    ang_vel_xy = ConTerm(func=mdp.ang_vel_xy_l2, kind="prob", limit=ANG_VEL_XY_LIMIT, bound=PROB_ALLOWANCE)
+    lin_vel_z = ConTerm(func=mdp.lin_vel_z_l2, kind="mean", bound=LIN_VEL_Z_BOUND, lambda_init=LAMBDA_LIN_VEL_Z)
+    ang_vel_xy = ConTerm(func=mdp.ang_vel_xy_l2, kind="mean", bound=ANG_VEL_XY_BOUND, lambda_init=LAMBDA_ANG_VEL_XY)
     flat_orientation = ConTerm(
-        func=mdp.flat_orientation_l2, kind="prob", limit=FLAT_ORIENTATION_LIMIT, bound=PROB_ALLOWANCE
+        func=mdp.flat_orientation_l2, kind="mean", bound=FLAT_ORIENTATION_BOUND, lambda_init=LAMBDA_FLAT_ORIENTATION
     )
     base_height = ConTerm(
-        func=mdp.base_height_l2, kind="mean", bound=BASE_HEIGHT_BOUND, params={"target_height": 0.78}
+        func=mdp.base_height_l2,
+        kind="mean",
+        bound=BASE_HEIGHT_BOUND,
+        lambda_init=LAMBDA_BASE_HEIGHT,
+        params={"target_height": 0.78},
     )
 
     # -- joints
-    joint_vel = ConTerm(func=mdp.joint_vel_l2, kind="mean", bound=JOINT_VEL_BOUND)
-    joint_acc = ConTerm(func=mdp.joint_acc_l2, kind="mean", bound=JOINT_ACC_BOUND)
-    action_rate = ConTerm(func=mdp.action_rate_l2, kind="mean", bound=ACTION_RATE_BOUND)
-    dof_pos_limits = ConTerm(func=mdp.joint_pos_limits, kind="prob", limit=DOF_POS_LIMIT, bound=PROB_ALLOWANCE)
+    joint_vel = ConTerm(func=mdp.joint_vel_l2, kind="mean", bound=JOINT_VEL_BOUND, lambda_init=LAMBDA_JOINT_VEL)
+    joint_acc = ConTerm(func=mdp.joint_acc_l2, kind="mean", bound=JOINT_ACC_BOUND, lambda_init=LAMBDA_JOINT_ACC)
+    action_rate = ConTerm(func=mdp.action_rate_l2, kind="mean", bound=ACTION_RATE_BOUND, lambda_init=LAMBDA_ACTION_RATE)
+    # Joint limits twice, on purpose: the mean of the soft-limit excess is the baseline's continuous penalty
+    # (the learning signal: how far, which way), the indicator is the paper-style specification (at most 2.5%
+    # of steps beyond the soft limit). Once the mean is under its bound its multiplier decays and the prob
+    # term is what remains. The hard limits are enforced by PhysX anyway; these keep the policy off them.
+    dof_pos_excess = ConTerm(
+        func=mdp.joint_pos_limits, kind="mean", bound=DOF_POS_EXCESS_BOUND, lambda_init=LAMBDA_DOF_POS_EXCESS
+    )
+    dof_pos_limits = ConTerm(
+        func=mdp.joint_pos_limits, kind="prob", limit=DOF_POS_LIMIT, bound=PROB_ALLOWANCE, lambda_init=LAMBDA_DOF_POS_LIMITS
+    )
     joint_deviation_arm_swing = ConTerm(
         func=mdp.joint_deviation_l1,
         kind="mean",
         bound=DEV_ARM_SWING_BOUND,
+        lambda_init=LAMBDA_DEV_ARM_SWING,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_shoulder_pitch_joint", ".*_elbow_joint"])},
     )
     joint_deviation_arm_lateral = ConTerm(
         func=mdp.joint_deviation_l1,
         kind="mean",
         bound=DEV_ARM_LATERAL_BOUND,
+        lambda_init=LAMBDA_DEV_ARM_LATERAL,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", joint_names=[".*_shoulder_roll_joint", ".*_shoulder_yaw_joint", ".*_wrist_.*"]
@@ -169,12 +215,14 @@ class ConstraintsCfg:
         func=mdp.joint_deviation_l1,
         kind="mean",
         bound=DEV_WAIST_BOUND,
+        lambda_init=LAMBDA_DEV_WAIST,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["waist.*"])},
     )
     joint_deviation_legs = ConTerm(
         func=mdp.joint_deviation_l1,
         kind="mean",
         bound=DEV_LEGS_BOUND,
+        lambda_init=LAMBDA_DEV_LEGS,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
     )
 
@@ -183,6 +231,7 @@ class ConstraintsCfg:
         func=mdp.feet_slide,
         kind="mean",
         bound=FEET_SLIDE_BOUND,
+        lambda_init=LAMBDA_FEET_SLIDE,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
@@ -193,22 +242,14 @@ class ConstraintsCfg:
         kind="prob",
         limit=UNDESIRED_CONTACT_LIMIT,
         bound=PROB_ALLOWANCE,
+        lambda_init=LAMBDA_UNDESIRED_CONTACTS,
         params={"threshold": 1, "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*).*"])},
     )
 
 
-TRACK_KERNEL_STD = math.sqrt(0.1)  # the baseline's track_lin_vel_xy kernel std, for the curriculum gate
-
-
 @configclass
 class CurriculumCfg(BaseCurriculumCfg):
-    """Baseline curriculum with the velocity gate read from the tracking metric, plus the energy gate."""
-
-    # The baseline gate reads the track_lin_vel_xy reward term, which is a constraint here; same 0.8 kernel
-    # threshold and the same 0.05 yaw widening, read from velocity/track_xy_kernel instead.
-    lin_vel_cmd_levels = CurrTerm(
-        func=mdp.lin_vel_cmd_levels_from_metric, params={"threshold": 0.8, "ang_vel_delta": 0.05}
-    )
+    """Baseline curriculum (velocity gate on the tracking reward, as before) plus the energy gate."""
 
     joint_energy_pace_weight = CurrTerm(
         func=mdp.reward_weight_after_standing,
@@ -227,17 +268,9 @@ class RobotEnvCfg(BaseRobotEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
     constraints: ConstraintsCfg = ConstraintsCfg()
 
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.base_velocity.track_kernel_std = TRACK_KERNEL_STD
-
 
 @configclass
 class RobotPlayEnvCfg(BaseRobotPlayEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
     constraints: ConstraintsCfg = ConstraintsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.base_velocity.track_kernel_std = TRACK_KERNEL_STD

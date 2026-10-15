@@ -80,7 +80,7 @@ class RslRlAmpCfg:
     motion_files: list[str] = MISSING
     """Reference motion npz files produced by ``scripts/mimic/csv_to_npz.py``."""
     obs_group: str = "amp"
-    speed_range: tuple[float, float] = (0.0, 2.5)
+    speed_range: tuple[float, float] = (0.2, 2.5)  # 2026-10-15: back to 0.2, idle frames out (see amp_edit_noRSI)
     """Default per-transition speed gate. Lower bound 0.0 since 2026-10-13 so standing frames count as
     reference (AMP paper samples the whole dataset); per-clip bands below override it."""
     clip_speed_ranges: list[tuple[float, float]] | None = None
@@ -91,7 +91,7 @@ class RslRlAmpCfg:
     speed_matched_sampling: bool = True
     speed_match_window: float = 0.1
 
-    reward_weight: float = 3.0
+    reward_weight: float = 2.0  # 2026-10-15: 3.0 made style ~1.4/s vs tracking 1.5/s; curriculum stalled at 2.2
     """Style reward weight in task-reward units. 2.0 (= track_lin_vel_xy) until 2026-10-13; 3.0 moves the
     style term towards the AMP paper's equal blend with the task reward without reaching the 09-21
     regime (effective 10) where the policy stood still for style reward."""
@@ -102,7 +102,7 @@ class RslRlAmpCfg:
     ramp_end_iter: int = 0
     
     command_name: str | None = "base_velocity"
-    command_gate: float = 0.0
+    command_gate: float = 0.1  # 2026-10-15: no style reward below a 0.1 m/s command (was 0.0)
     """Commands below this get no style reward. 0.0 since 2026-10-13: standing frames are in the reference
     set, so standing environments are scored against standing references (speed matching pairs them)."""
     
@@ -129,9 +129,14 @@ class RslRlAmpCfg:
 # ConstraintsCfg (env cfg, next to the rewards); only the multiplier dynamics are set here. Costs reach
 # the penalty divided by their bound, so lambda is comparable across terms: lambda = 1 charges one
 # reward-weight unit per "one bound's worth" of cost (the baseline's penalty weights span 0.05-10).
-CONSTRAINT_LAMBDA_LR = 1.0e-2  # per iteration per unit of relative violation; 30% over -> +3e-3/iter, lambda 1 in ~330 iters
-CONSTRAINT_LAMBDA_MAX = 10.0  # default cap; a ConstraintTermCfg.lambda_max overrides it per term
-CONSTRAINT_VIOLATION_CLIP = 1.0  # dual step uses clip(J-1, -1, 1): a multiplier moves at most lr per iteration
+# 2026-10-14 run 17-49-26: tracking as ungated constraints, lambda_max 10 -> policy learned to die in 3 steps.
+# Run 18-31-38: additive steps of 0.01 on all 16 terms reached 10-200x the baseline weights within 100 iters of
+# the gate opening (penalty 7.6/step) -> same collapse. Hence baseline-equivalent lambda_init + multiplicative steps.
+CONSTRAINT_UPDATE_RULE = "multiplicative"  # lambda *= exp(lr * clip(J-1)); see the extension docstring (2026-10-14)
+CONSTRAINT_LAMBDA_LR = 1.0e-2  # 1% per iteration per unit of clipped relative violation: 100 violated iters -> x2.7
+CONSTRAINT_VIOLATION_CLIP = 1.0  # relative violation clipped to +-1 before the dual step
+CONSTRAINT_LAMBDA_MAX_RATIO = 10.0  # per-term cap = 10 x lambda_init (the baseline-equivalent weight)
+CONSTRAINT_LAMBDA_MAX = 2.0  # absolute cap, only for terms that start at 0 (none in the current task)
 
 
 @configclass
@@ -139,8 +144,10 @@ class RslRlConstraintCfg:
     """Lagrangian solver settings, consumed by
     :class:`unitree_rl_lab.algorithms.constraints.extension.LagrangianPenaltyExtension`."""
 
+    update_rule: str = CONSTRAINT_UPDATE_RULE
     lambda_lr: float = CONSTRAINT_LAMBDA_LR
     lambda_max: float = CONSTRAINT_LAMBDA_MAX
+    lambda_max_ratio: float | None = CONSTRAINT_LAMBDA_MAX_RATIO
     violation_clip: float | None = CONSTRAINT_VIOLATION_CLIP
     """Clip the relative violation to +-this before the dual step (None: no clip); see the extension."""
     start_after_standing: bool = True
@@ -185,7 +192,7 @@ LAFAN1_WALK_CLIPS = [
 # which has almost no data below 0.6 m/s (speed matching fell back to nearest neighbours there).
 # Walk band from 0.0 (2026-10-13): the idle stretches of the walk takes -- a person standing about -- are
 # the standing reference the task needs at zero command. Run takes stay gated from 1.0 m/s.
-AMP_WALK_SPEED_BAND = (0.0, 1.0)
+AMP_WALK_SPEED_BAND = (0.2, 1.0)  # 2026-10-15: lower bound back to 0.2 (idle frames out)
 AMP_RUN_SPEED_BAND = (1.0, 2.5)
 LAFAN1_BANDED_CLIPS = LAFAN1_WALK_CLIPS + LAFAN1_RUN_CLIPS
 LAFAN1_BANDED_SPEED_RANGES = [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_CLIPS) + [AMP_RUN_SPEED_BAND] * len(
@@ -200,7 +207,7 @@ LAFAN1_WALK_LOWCOT_CLIPS = [os.path.join(_LAFAN1_WALK_DIR, f"{n}.npz") for n in 
 LAFAN1_RUN_LOWCOT_CLIPS = [os.path.join(_LAFAN1_RUN_DIR, f"{n}.npz") for n in ("run2_subject4", "run1_subject5")]
 KIMODO_CLIPS = [os.path.join(_KIMODO_DIR, f"kimodo_{i}.npz") for i in range(1, 5)]
 """Kimodo-generated G1 clips (10 s each, 30 fps csv; npz built with ``csv_to_npz.py --input_fps 30``)."""
-AMP_KIMODO_SPEED_BAND = (0.0, 2.5)
+AMP_KIMODO_SPEED_BAND = (0.2, 2.5)
 LOWCOT_CLIPS = LAFAN1_WALK_LOWCOT_CLIPS + LAFAN1_RUN_LOWCOT_CLIPS + KIMODO_CLIPS
 LOWCOT_SPEED_RANGES = (
     [AMP_WALK_SPEED_BAND] * len(LAFAN1_WALK_LOWCOT_CLIPS)
