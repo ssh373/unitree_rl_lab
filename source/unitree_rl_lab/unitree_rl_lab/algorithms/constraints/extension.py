@@ -26,7 +26,11 @@ a relative step keeps the baseline's weight ratios and lets only the violated te
 ``exp(lr)`` per iteration. With the multiplicative rule a term initialized at 0 stays at 0, so every
 term needs a positive ``lambda_init`` (``running_constrained_env_cfg.py`` derives them from the baseline
 weights). The per-term cap defaults to ``lambda_max_ratio * lambda_init``: a multiplier sitting at its cap
-says the bound is infeasible for this policy.
+says the bound is infeasible for this policy. The cap is also what keeps the penalized return positive:
+with the G1 running bounds the sum of all baseline-equivalent penalties is ~0.01/step against ~0.1/step of
+positive reward, so 10x (run 2026-10-15_20-14-53: six terms at cap 230 iterations after standing, policy
+collapsed into falling) can cancel the task reward while 3x cannot. ``lambda_min_ratio`` keeps a floor
+under satisfied terms so they can come back.
 
 Compared with IPO (the paper's solver) there is no cost critic and no barrier: the per-state information
 still reaches the policy because the cost enters the per-step reward; only the *weight* comes from a
@@ -65,8 +69,11 @@ class LagrangianPenaltyExtension(PPOExtension):
         lambda_lr: float = 1.0e-2,
         lambda_max: float = 10.0,
         lambda_max_ratio: float | None = None,
+        lambda_min_ratio: float | None = None,
         update_rule: str = "additive",
         violation_clip: float | None = None,
+        cost_clip: float | None = None,
+        gate: str = "standing",
         start_after_standing: bool = True,
         ep_len_threshold: float = 500.0,
         device: str = "cpu",
@@ -78,7 +85,17 @@ class LagrangianPenaltyExtension(PPOExtension):
             lambda_max: Default cap on every multiplier; a term's ``lambda_max`` overrides it.
             lambda_max_ratio: If set, a term's cap is ``ratio * lambda_init`` (when its ``lambda_init`` > 0 and
                 it has no explicit ``lambda_max``); ``lambda_max`` then only applies to terms starting at 0.
+            lambda_min_ratio: If set, a term's multiplier never drops below ``ratio * lambda_init``, so a
+                constraint that was satisfied for thousands of iterations can still come back (the
+                multiplicative rule otherwise decays it to ~0 and needs as long to climb back).
             update_rule: ``"additive"`` or ``"multiplicative"`` dual step (see the module docstring).
+            cost_clip: If set, each bound-normalized per-step cost is clipped at this many bounds before it
+                enters the penalty, so a physics glitch (joint velocities of a fallen robot) cannot inject an
+                astronomically large reward and blow up the critic (run 2026-10-15_20-14-53 died of a
+                1e19 action-rate cost -> value inf -> policy std NaN).
+            gate: ``"standing"`` (episode-length test below), ``"curriculum"`` (the base_velocity command
+                range has reached its limit range, i.e. the velocity curriculum is complete) or ``"none"``.
+                Gated terms hold ``lambda_init`` until the gate opens; it latches.
             violation_clip: If set, the relative violation is clipped to ``[-clip, clip]`` before the dual
                 step, so a multiplier moves by at most ``lr * clip`` per iteration. Costs are unbounded
                 above (a random policy's yaw error is 40x its bound) and without the clip the early
@@ -91,10 +108,15 @@ class LagrangianPenaltyExtension(PPOExtension):
             raise RuntimeError("LagrangianPenaltyExtension needs the environment (injected by ExtendedOnPolicyRunner).")
         if update_rule not in ("additive", "multiplicative"):
             raise ValueError(f"update_rule must be 'additive' or 'multiplicative', got {update_rule!r}.")
+        if gate not in ("standing", "curriculum", "none"):
+            raise ValueError(f"gate must be 'standing', 'curriculum' or 'none', got {gate!r}.")
         self.update_rule = update_rule
         self.lambda_lr = float(lambda_lr)
         self.violation_clip = None if violation_clip is None else float(violation_clip)
-        self.start_after_standing = start_after_standing
+        self.cost_clip = None if cost_clip is None else float(cost_clip)
+        # ``start_after_standing=False`` is the legacy spelling of gate="none".
+        self.gate = gate if start_after_standing else "none"
+        self.start_after_standing = self.gate != "none"
         self.ep_len_threshold = float(ep_len_threshold)
         self.device = device
         self._env = _env
@@ -127,6 +149,9 @@ class LagrangianPenaltyExtension(PPOExtension):
             else:
                 caps.append(float(lambda_max))
         self.lambda_max = torch.tensor(caps, dtype=torch.float, device=device)
+        self.lambda_min = (
+            self.lmbda * float(lambda_min_ratio) if lambda_min_ratio is not None else torch.zeros_like(self.lmbda)
+        )
         if update_rule == "multiplicative" and bool((self.lmbda <= 0.0).any()):
             zero = [n for n, v in zip(self.term_names, self.lmbda.tolist()) if v <= 0.0]
             print(f"[LagrangianPenaltyExtension] multiplicative update: terms starting at 0 stay at 0: {zero}")
@@ -134,7 +159,8 @@ class LagrangianPenaltyExtension(PPOExtension):
         self.is_prob = manager.is_prob.to(device)
 
         self.iteration = 0
-        self.gate_open = not start_after_standing
+        self.gate_open = self.gate == "none"
+        self._skipped_updates = 0
         # Per-rollout accumulators (normalized cost, raw value) and the penalty.
         self._cost_sum = torch.zeros(num_terms, device=device)
         self._raw_sum = torch.zeros(num_terms, device=device)
@@ -149,8 +175,16 @@ class LagrangianPenaltyExtension(PPOExtension):
 
     # -- rollout ------------------------------------------------------------------------------
 
+    def _curriculum_complete(self) -> bool:
+        cfg = self._env.unwrapped.command_manager.get_term("base_velocity").cfg
+        return float(cfg.ranges.lin_vel_x[1]) >= float(cfg.limit_ranges.lin_vel_x[1]) - 1e-6
+
     def _track_standing(self, dones: torch.Tensor) -> None:
         if self.gate_open:
+            return
+        if self.gate == "curriculum":
+            if self._curriculum_complete():
+                self.gate_open = True
             return
         env = self._env.unwrapped
         num_envs = dones.shape[0]
@@ -176,6 +210,8 @@ class LagrangianPenaltyExtension(PPOExtension):
         with torch.no_grad():
             raw = self.manager.compute().to(rewards.device)  # (N, K)
             cost = self.manager.normalized_cost(raw).to(rewards.device)
+            if self.cost_clip is not None:
+                cost = cost.clamp(max=self.cost_clip)
             # A reset env reports the reset state's cost, not the transition's: drop it.
             keep = (1.0 - dones.float().to(rewards.device)).view(-1, 1)
             raw = raw * keep
@@ -219,13 +255,18 @@ class LagrangianPenaltyExtension(PPOExtension):
             logs[f"constraint/{name}/lambda_frac_of_cap"] = (self.lmbda[k] / self.lambda_max[k]).item()
 
         active = (~self.gated) | self.gate_open
-        step = violation if self.violation_clip is None else violation.clamp(-self.violation_clip, self.violation_clip)
-        if self.update_rule == "multiplicative":
-            new_lmbda = self.lmbda * torch.exp(self.lambda_lr * step)
+        if not bool(torch.isfinite(violation).all()):
+            # A glitched rollout (inf/nan cost) must not reach the multipliers or the checkpoint.
+            self._skipped_updates += 1
+            logs["constraint/skipped_updates"] = float(self._skipped_updates)
         else:
-            new_lmbda = (self.lmbda + self.lambda_lr * step).clamp(min=0.0)
-        new_lmbda = torch.minimum(new_lmbda, self.lambda_max)
-        self.lmbda = torch.where(active, new_lmbda, self.lmbda)
+            step = violation if self.violation_clip is None else violation.clamp(-self.violation_clip, self.violation_clip)
+            if self.update_rule == "multiplicative":
+                new_lmbda = self.lmbda * torch.exp(self.lambda_lr * step)
+            else:
+                new_lmbda = (self.lmbda + self.lambda_lr * step).clamp(min=0.0)
+            new_lmbda = torch.minimum(torch.maximum(new_lmbda, self.lambda_min), self.lambda_max)
+            self.lmbda = torch.where(active, new_lmbda, self.lmbda)
 
         self.iteration += 1
         self._cost_sum.zero_()

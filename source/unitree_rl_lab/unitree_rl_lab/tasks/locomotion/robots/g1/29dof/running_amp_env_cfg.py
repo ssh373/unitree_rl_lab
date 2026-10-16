@@ -17,12 +17,20 @@ from .running_env_cfg import RobotEnvCfg as BaseRobotEnvCfg
 from .running_env_cfg import RobotPlayEnvCfg as BaseRobotPlayEnvCfg
 
 from .running_env_cfg import CurriculumCfg as BaseCurriculumCfg
-from .running_reward_env_cfg import _gate
+from .running_reward_env_cfg import (
+    FOOT_FORCE_THRESHOLD_N,
+    FOOT_FORCE_WEIGHT,
+    PACE_ENERGY_WEIGHT,
+    PACE_K_EL,
+    PACE_K_REGEN,
+    PACE_SPEED_EXPONENT,
+    _gate,
+)
 from unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg import LOWCOT_CLIPS, LOWCOT_SPEED_RANGES
 
-# PACE constants (PACE_ENERGY_WEIGHT, PACE_K_EL, PACE_K_REGEN, PACE_SPEED_EXPONENT) were imported from
-# running_reward_env_cfg until 2026-10-12, when its PACE block was commented out. The joint_energy_pace
-# term below has been commented out since 10-02, so the import went with it; restore both together.
+# 2026-10-16: the "pace+force" pair from running_reward_env_cfg (PACE power cost + peak-GRF penalty) is
+# added on top of the amp_edit (10-15) rewards with the same constants, so the only difference to the
+# 2026-10-15_11-18-38_amp_edit run is these two gated terms (both weight 0 until the policy stands).
 
 
 
@@ -95,19 +103,28 @@ class RewardsCfg(BaseRewardsCfg):
         },
     )
 
-    # TEMP: PACE power cost on the AMP arm. Disabled 2026-10-02 (user request) for a pure-AMP run with the
-    # speed-banded walk/run reference set; uncomment this term AND the CurriculumCfg / curriculum lines
-    # below to re-enable.
-    # joint_energy_pace = RewTerm(
-    #     func=mdp.pace_energy_cost,
-    #     weight=0.0,
-    #     params={
-    #         "k_el": PACE_K_EL,
-    #         "k_regen": PACE_K_REGEN,
-    #         "include_potential": False,
-    #         "speed_exponent": PACE_SPEED_EXPONENT,
-    #     },
-    # )
+    # PACE power cost (same term and constants as Running-Reward "pace+force", re-enabled 2026-10-16).
+    joint_energy_pace = RewTerm(
+        func=mdp.pace_energy_cost,
+        weight=0.0,
+        params={
+            "k_el": PACE_K_EL,
+            "k_regen": PACE_K_REGEN,
+            "include_potential": False,
+            "speed_exponent": PACE_SPEED_EXPONENT,
+        },
+    )
+    # Peak ground reaction force above FOOT_FORCE_THRESHOLD_N (2.0 BW), max over one policy step of
+    # substeps (contact_forces.history_length = decimation, set in RobotEnvCfg.__post_init__), summed
+    # over both feet. Same term and constants as Running-Reward "pace+force".
+    feet_force = RewTerm(
+        func=mdp.contact_forces,
+        weight=0.0,
+        params={
+            "threshold": FOOT_FORCE_THRESHOLD_N,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=GAIT_FEET_BODY_NAMES),
+        },
+    )
 
 
 WRIST_DEVIATION_WEIGHT = -0.5  # same as joint_deviation_arm_lateral in the base cfg
@@ -137,12 +154,12 @@ class EventCfg(BaseEventCfg):
 
 
 # Standing gates (weight 0 until the mean episode length passes STAND_EP_LEN, then a 500-iter ramp),
-# shared tracker and latch with the energy variants. The PACE line stays commented together with the
-# joint_energy_pace term above (2026-10-02); uncomment both to re-enable it.
+# shared tracker and latch with the energy variants.
 @configclass
 class CurriculumCfg(BaseCurriculumCfg):
     joint_deviation_wrist_weight = _gate("joint_deviation_wrist", WRIST_DEVIATION_WEIGHT)
-    # joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
+    joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
+    feet_force_weight = _gate("feet_force", FOOT_FORCE_WEIGHT)
 
 
 # Where the velocity curriculum starts. The baseline starts at (-0.4, 0.4); the AMP arm starts
@@ -164,11 +181,14 @@ class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
     events: EventCfg = EventCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()  # wrist standing gate (+ PACE gate when re-enabled)
+    curriculum: CurriculumCfg = CurriculumCfg()  # wrist, PACE and feet_force standing gates
 
     def __post_init__(self):
         super().__post_init__()
         self.commands.base_velocity.ranges.lin_vel_x = AMP_START_LIN_VEL_X
+        # One policy step of force samples (3 -> 4 substeps) so feet_force sees the peak at every substep
+        # (as in running_reward_env_cfg). feet_air_time uses contact timers, not the history.
+        self.scene.contact_forces.history_length = self.decimation
 
 
 @configclass
@@ -178,3 +198,7 @@ class RobotPlayEnvCfg(BaseRobotPlayEnvCfg):
 
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.contact_forces.history_length = self.decimation

@@ -135,7 +135,10 @@ class RslRlAmpCfg:
 CONSTRAINT_UPDATE_RULE = "multiplicative"  # lambda *= exp(lr * clip(J-1)); see the extension docstring (2026-10-14)
 CONSTRAINT_LAMBDA_LR = 1.0e-2  # 1% per iteration per unit of clipped relative violation: 100 violated iters -> x2.7
 CONSTRAINT_VIOLATION_CLIP = 1.0  # relative violation clipped to +-1 before the dual step
-CONSTRAINT_LAMBDA_MAX_RATIO = 10.0  # per-term cap = 10 x lambda_init (the baseline-equivalent weight)
+CONSTRAINT_LAMBDA_MAX_RATIO = 3.0  # per-term cap = 3 x lambda_init; 10x cancelled the task reward (run 10-15_20-14-53)
+CONSTRAINT_LAMBDA_MIN_RATIO = 0.1  # floor = 0.1 x lambda_init so a satisfied term can still come back
+CONSTRAINT_COST_CLIP = 100.0  # per-step normalized cost clipped at 100 bounds (glitch guard; max seen in training ~47)
+CONSTRAINT_GATE = "standing"  # or "curriculum" (velocity range at its limit) / "none"
 CONSTRAINT_LAMBDA_MAX = 2.0  # absolute cap, only for terms that start at 0 (none in the current task)
 
 
@@ -148,7 +151,10 @@ class RslRlConstraintCfg:
     lambda_lr: float = CONSTRAINT_LAMBDA_LR
     lambda_max: float = CONSTRAINT_LAMBDA_MAX
     lambda_max_ratio: float | None = CONSTRAINT_LAMBDA_MAX_RATIO
+    lambda_min_ratio: float | None = CONSTRAINT_LAMBDA_MIN_RATIO
     violation_clip: float | None = CONSTRAINT_VIOLATION_CLIP
+    cost_clip: float | None = CONSTRAINT_COST_CLIP
+    gate: str = CONSTRAINT_GATE
     """Clip the relative violation to +-this before the dual step (None: no clip); see the extension."""
     start_after_standing: bool = True
     """Hold the gated multipliers at their lambda_init until the policy stands (same test as the reward gate)."""
