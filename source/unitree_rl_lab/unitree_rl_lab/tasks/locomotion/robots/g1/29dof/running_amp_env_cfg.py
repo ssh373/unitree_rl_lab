@@ -57,6 +57,10 @@ class ObservationsCfg(BaseObservationsCfg):
     amp: AmpObsCfg = AmpObsCfg()
 
 
+WAIST_STAND_DEVIATION_WEIGHT = -1.0  # same as joint_deviation_waists in the base cfg
+WAIST_STAND_CMD_THRESHOLD = 0.2  # AMP reference speed floor (AMP_WALK/KIMODO band lower bound in rsl_rl_ppo_cfg)
+
+
 @configclass
 class RewardsCfg(BaseRewardsCfg):
     """Baseline rewards without the clock-driven gait terms and the hand-crafted posture terms, plus one
@@ -126,6 +130,22 @@ class RewardsCfg(BaseRewardsCfg):
         },
     )
 
+    # Waist posture at slow commands only (2026-10-19). Below the AMP command_gate (0.1 m/s) the style reward is
+    # zero, and between 0.1 and the 0.2 m/s reference band floor it carries no posture information (no reference
+    # transitions there), so nothing held the waist and the torso bowed forward at low speed; the gated reference
+    # set itself leans the waist ~10 deg back at every speed. The baseline's joint_deviation_waists kernel and
+    # weight, masked to commands below WAIST_STAND_CMD_THRESHOLD so the discriminator keeps the waist above it.
+    # Weight 0 until the standing gate opens (CurriculumCfg), like the wrist term.
+    joint_deviation_waist_stand = RewTerm(
+        func=mdp.joint_deviation_l1_below_cmd,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["waist.*"]),
+            "command_name": "base_velocity",
+            "command_threshold": WAIST_STAND_CMD_THRESHOLD,
+        },
+    )
+
 
 WRIST_DEVIATION_WEIGHT = -0.5  # same as joint_deviation_arm_lateral in the base cfg
 
@@ -160,6 +180,7 @@ class CurriculumCfg(BaseCurriculumCfg):
     joint_deviation_wrist_weight = _gate("joint_deviation_wrist", WRIST_DEVIATION_WEIGHT)
     joint_energy_pace_weight = _gate("joint_energy_pace", PACE_ENERGY_WEIGHT)
     feet_force_weight = _gate("feet_force", FOOT_FORCE_WEIGHT)
+    joint_deviation_waist_stand_weight = _gate("joint_deviation_waist_stand", WAIST_STAND_DEVIATION_WEIGHT)
 
 
 # Where the velocity curriculum starts. The baseline starts at (-0.4, 0.4); the AMP arm starts
@@ -181,7 +202,7 @@ class RobotEnvCfg(BaseRobotEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
     events: EventCfg = EventCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()  # wrist, PACE and feet_force standing gates
+    curriculum: CurriculumCfg = CurriculumCfg()  # wrist, PACE, feet_force and waist-at-stand standing gates
 
     def __post_init__(self):
         super().__post_init__()

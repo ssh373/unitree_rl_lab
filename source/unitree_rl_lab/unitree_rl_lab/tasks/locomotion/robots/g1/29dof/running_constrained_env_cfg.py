@@ -22,8 +22,8 @@ Thresholds (set 2026-10-14) come from the baseline policy's per-step statistics
 slack, user decision); the two ``prob`` terms (joint limits, non-foot contact) use limit 0 with the paper's
 2.5% allowance (user decision). 2026-10-15: ang_vel_xy, flat_orientation and the joint-limit excess became
 mean terms after run ``18-57-49`` never stood with them as indicators (no gradient, 30x too weak at the
-limits); the joint-limit indicator stays as a second, specification-style constraint on the same quantity. Yaw tracking is the one bound set *tighter* than baseline (0.08 rad/s vs. the measured
-0.31): the user wants yaw tracked about as well as x. If a bound is infeasible its multiplier sits at the cap:
+limits); the joint-limit indicator stays as a second, specification-style constraint on the same quantity. Yaw tracking is the one bound set *tighter* than baseline (0.25 rad/s vs. the measured
+0.31; the earlier 0.08 was 6x violated throughout and only acted as a constant penalty). If a bound is infeasible its multiplier sits at the cap:
 watch ``Loss/constraint/track_ang_vel_z/lambda`` (bounds can be changed and the run resumed; multipliers are
 checkpointed by name).
 
@@ -66,7 +66,7 @@ STAND_RAMP_ITERS = 500
 PROB_ALLOWANCE = 0.025  # paper: 2.5% of steps may violate a probabilistic constraint
 # mean terms: bound = baseline mean
 TRACK_LIN_VEL_BOUND = 0.077  # m/s   mean |v_cmd - v|            baseline 0.0771 (p50 0.032, p97.5 0.66)
-TRACK_ANG_VEL_BOUND = 0.08  # rad/s mean |w_cmd - w_z|          baseline 0.311 -> tightened to ~x level (user, 2026-10-14)
+TRACK_ANG_VEL_BOUND = 0.25  # rad/s mean |w_cmd - w_z|          baseline 0.311, tightened ~20% (user, 2026-10-19); 0.08 was never met (6x violated)
 LIN_VEL_Z_BOUND = 0.121  # (m/s)^2 mean v_z^2                   baseline 0.1207
 BASE_HEIGHT_BOUND = 0.00241  # m^2 mean (h - 0.78)^2            baseline 0.00241 (mean height 0.737 m)
 JOINT_VEL_BOUND = 57.4  # (rad/s)^2 mean sum qdot^2             baseline 57.38
@@ -129,6 +129,12 @@ class RewardsCfg(BaseRewardsCfg):
     base_height = None
     feet_slide = None
     undesired_contacts = None
+
+    # Falling must never be the cheap way out of the penalties: with the multipliers free to grow, three
+    # runs (10-14, 10-15, 10-19) slid into "end the episode early" once penalty + energy outweighed the
+    # positive per-step reward. -200 is Isaac Lab's official G1 value; -4 per fall (x dt) exceeds anything an
+    # early termination can save. Time-outs are not charged.
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
 
     # Starts at 0 and is ramped in by the standing gate (CurriculumCfg), as in the Energy reward arm.
     joint_energy_pace = RewTerm(

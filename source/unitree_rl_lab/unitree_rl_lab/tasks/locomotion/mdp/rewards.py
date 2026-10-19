@@ -339,6 +339,27 @@ def feet_contact_without_cmd(
     return reward * _standing_command_mask(env, command_name, command_threshold)
 
 
+def joint_deviation_l1_below_cmd(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Isaac Lab's ``joint_deviation_l1`` (sum |q - q_default|), applied only where the command norm is below
+    ``command_threshold``; zero elsewhere.
+
+    2026-10-19: the AMP arm has no posture term at slow commands -- the style reward is gated off below
+    ``command_gate`` (0.1 m/s) and has no reference transitions below the 0.2 m/s band floor, so speed matching
+    falls back to faster references and the discriminator separates the sides by speed -- and the torso bowed
+    forward at low speed. The gated reference set itself never bows (waist pitch -10 to -14 deg at every speed).
+    This term fills exactly that band and is silent where the discriminator sees the waist.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    deviation = torch.sum(torch.abs(angle), dim=1)
+    return deviation * _standing_command_mask(env, command_name, command_threshold)
+
+
 def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize variance in the amount of time each foot spends in the air/on the ground relative to each other"""
     # extract the used quantities (to enable type-hinting)
