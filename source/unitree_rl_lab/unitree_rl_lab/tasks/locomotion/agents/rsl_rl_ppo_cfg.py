@@ -287,3 +287,15 @@ class RunningConstrainedPPORunnerCfg(RunningPPORunnerCfg):
         ),
         constraint_cfg=RslRlConstraintCfg(),
     )
+
+
+@configclass
+class RunningSafetyCrlPPORunnerCfg(RunningConstrainedPPORunnerCfg):
+    """Safety-CRL (running_safety_crl_env_cfg.py): three safety constraints on top of the PACE objective.
+    With so few terms the penalty cannot outweigh the task reward, so the per-term cap is 10x the start value."""
+
+    def __post_init__(self):
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+        self.algorithm.constraint_cfg.lambda_max_ratio = 10.0
+

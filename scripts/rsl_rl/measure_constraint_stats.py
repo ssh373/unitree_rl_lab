@@ -57,6 +57,22 @@ parser.add_argument(
 )
 parser.add_argument("--out", type=str, default=None, help="Optional CSV path for the result table.")
 parser.add_argument(
+    "--stochastic",
+    action="store_true",
+    default=False,
+    help="Sample actions from the policy's Gaussian (its trained noise std) instead of the deterministic mean."
+    " The constraint extension measures costs on exploration rollouts during training, so bounds meant for it"
+    " must be measured the same way; e.g. action_rate carries a noise floor of ~2*std^2*num_joints.",
+)
+parser.add_argument(
+    "--train_cfg",
+    action="store_true",
+    default=False,
+    help="Use the training env cfg (observation noise, pushes, action delay/noise, 4096-env scene defaults) with the"
+    " command ranges opened to their limits, instead of the play cfg. Combine with --terrain generator to measure"
+    " under the conditions the training-time metrics are logged in.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 cli_args.add_rsl_rl_args(parser)
@@ -86,6 +102,13 @@ from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 PERCENTILES = (50.0, 90.0, 95.0, 97.5, 99.0)
 
+# Safety-limit definitions mirrored from the sim2real protection (deploy/robots/g1_29dof/config/config.yaml):
+# commanded torque is clamped at TORQUE_CLAMP_RATIO x the motor peak (= the training effort limit), and the
+# upper body has a 15 rad/s joint-velocity kill threshold. Lower-body joints use the asset velocity limit.
+TORQUE_CLAMP_RATIO = 0.97
+UPPER_BODY_JOINT_REGEX = r"waist|shoulder|elbow|wrist"
+UPPER_BODY_VEL_LIMIT = 15.0
+
 
 def _freeze_env_cfg(env_cfg, terrain: str):
     """Pin the command distribution and terrain so the measurement is stationary."""
@@ -104,8 +127,24 @@ def _freeze_env_cfg(env_cfg, terrain: str):
     return env_cfg
 
 
+def _safety_limits(robot) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-joint (torque_limit, velocity_limit) the safety constraints are measured against."""
+    import re
+
+    torque_limit = robot.data.joint_effort_limits.clamp_min(1e-6) * TORQUE_CLAMP_RATIO
+    vel_limit = robot.data.joint_vel_limits.clamp_min(1e-6).clone()
+    upper = torch.tensor([bool(re.search(UPPER_BODY_JOINT_REGEX, n)) for n in robot.joint_names], device=vel_limit.device)
+    vel_limit[:, upper] = UPPER_BODY_VEL_LIMIT
+    return torque_limit, vel_limit
+
+
 def _raw_diagnostics(base_env, robot, contact_sensor, feet_ids, body_weight_n) -> dict[str, torch.Tensor]:
     """Continuous quantities behind the probabilistic constraints, in physical units."""
+    torque_limit, safety_vel_limit = _safety_limits(robot)
+    # Commanded (pre-clipping) torque: the simulator clips applied_torque at the effort limit, so only the
+    # computed torque shows how far past the limit the controller asked.
+    cmd_ratio = robot.data.computed_torque.abs() / torque_limit
+    vel_ratio_safety = robot.data.joint_vel.abs() / safety_vel_limit
     gravity_b = robot.data.projected_gravity_b
     tilt_deg = torch.rad2deg(torch.acos((-gravity_b[:, 2]).clamp(-1.0, 1.0)))
     vel_limit = robot.data.joint_vel_limits.clamp_min(1e-6)
@@ -125,6 +164,13 @@ def _raw_diagnostics(base_env, robot, contact_sensor, feet_ids, body_weight_n) -
         "raw/joint_torque_ratio_max": (robot.data.applied_torque.abs() / effort_limit).amax(dim=-1),
         "raw/joint_pos_excess_max_rad": pos_excess.amax(dim=-1),
         "raw/foot_force_peak_bw": foot_force.amax(dim=1).amax(dim=1) / body_weight_n,
+        # safety limits (sim2real definitions): max ratio over joints, violation indicator, summed excess
+        "safety/cmd_torque_ratio_max": cmd_ratio.amax(dim=-1),
+        "safety/cmd_torque_over_limit": (cmd_ratio > 1.0).any(dim=-1).float(),
+        "safety/cmd_torque_excess_sum": (cmd_ratio - 1.0).clamp_min(0.0).sum(dim=-1),
+        "safety/joint_vel_ratio_max": vel_ratio_safety.amax(dim=-1),
+        "safety/joint_vel_over_limit": (vel_ratio_safety > 1.0).any(dim=-1).float(),
+        "safety/joint_vel_excess_sum": (vel_ratio_safety - 1.0).clamp_min(0.0).sum(dim=-1),
         "raw/feet_in_contact": (contact_sensor.data.current_contact_time[:, feet_ids] > 0.0).sum(dim=1).float(),
     }
 
@@ -151,8 +197,11 @@ def main():
         device=args_cli.device,
         num_envs=args_cli.num_envs,
         use_fabric=not args_cli.disable_fabric,
-        entry_point_key="play_env_cfg_entry_point",
+        entry_point_key="env_cfg_entry_point" if args_cli.train_cfg else "play_env_cfg_entry_point",
     )
+    if args_cli.train_cfg:
+        # The play cfg already opens the command ranges; the training cfg starts them narrow for the curriculum.
+        env_cfg.commands.base_velocity.ranges = env_cfg.commands.base_velocity.limit_ranges
     env_cfg = _freeze_env_cfg(env_cfg, args_cli.terrain)
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
@@ -169,7 +218,16 @@ def main():
     runner_class = get_runner_class(getattr(agent_cfg, "class_name", "OnPolicyRunner"))
     runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+    if args_cli.stochastic:
+        actor = runner.alg.policy
+        std = actor.action_std if hasattr(actor, "action_std") else None
+
+        def policy(obs):
+            return actor.act(obs).detach()
+
+        print(f"[INFO] stochastic policy: sampling with the trained noise std (mean {float(actor.std.mean()) if hasattr(actor, 'std') else 'n/a'})")
+    else:
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     base_env = env.unwrapped
     robot = base_env.scene["robot"]

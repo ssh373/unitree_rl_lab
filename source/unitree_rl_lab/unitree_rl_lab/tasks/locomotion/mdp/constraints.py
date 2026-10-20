@@ -169,3 +169,59 @@ def track_ang_vel_z_error(
     """Yaw-rate tracking error ``|w_cmd - w_z|`` in rad/s (linear form of ``track_ang_vel_z_exp``)."""
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.abs(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 2])
+
+
+"""
+Safety-limit costs (definitions mirrored from the sim2real protection in deploy/robots/g1_29dof/config/config.yaml).
+"""
+
+
+def _torque_ratio(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, clamp_ratio: float) -> torch.Tensor:
+    """``|commanded torque| / (clamp_ratio * effort limit)`` per joint. Uses the pre-clipping ``computed_torque``:
+    the simulator clips ``applied_torque`` at the limit, which would hide how far past it the controller asked."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    limit = asset.data.joint_effort_limits[:, asset_cfg.joint_ids].clamp_min(1e-6) * clamp_ratio
+    return asset.data.computed_torque[:, asset_cfg.joint_ids].abs() / limit
+
+
+def cmd_torque_excess(
+    env: ManagerBasedRLEnv, clamp_ratio: float = 0.97, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Summed excess of the commanded-torque ratio above 1 (continuous: how far past the limit, which way)."""
+    return (_torque_ratio(env, asset_cfg, clamp_ratio) - 1.0).clamp_min(0.0).sum(dim=-1)
+
+
+def cmd_torque_over_limit(
+    env: ManagerBasedRLEnv, clamp_ratio: float = 0.97, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """1 on steps where any joint's commanded torque exceeds ``clamp_ratio`` x its limit (for a prob constraint)."""
+    return (_torque_ratio(env, asset_cfg, clamp_ratio) > 1.0).any(dim=-1).float()
+
+
+def joint_vel_over_limit(
+    env: ManagerBasedRLEnv,
+    upper_body_joint_regex: str = r"waist|shoulder|elbow|wrist",
+    upper_body_limit: float = 15.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """1 on steps where any joint exceeds its velocity limit: the sim2real upper-body kill threshold for the
+    waist/arm joints, the asset velocity limit elsewhere."""
+    import re
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cache_key = "_safety_vel_limit"
+    if not hasattr(env, cache_key):
+        limit = asset.data.joint_vel_limits.clamp_min(1e-6).clone()
+        upper = torch.tensor([bool(re.search(upper_body_joint_regex, n)) for n in asset.joint_names], device=limit.device)
+        limit[:, upper] = upper_body_limit
+        setattr(env, cache_key, limit)
+    limit = getattr(env, cache_key)
+    return (asset.data.joint_vel.abs() / limit > 1.0).any(dim=-1).float()
+
+
+def tilt_angle_deg(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Base tilt from vertical in degrees; a prob constraint with ``limit`` = the dangerous angle counts how often
+    the robot leans past it (a forward lean while running is normal, a large tilt is a fall in progress)."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.rad2deg(torch.acos((-asset.data.projected_gravity_b[:, 2]).clamp(-1.0, 1.0)))
+

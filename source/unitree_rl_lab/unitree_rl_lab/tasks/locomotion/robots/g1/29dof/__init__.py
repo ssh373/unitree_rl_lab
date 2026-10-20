@@ -87,3 +87,30 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningConstrainedPPORunnerCfg",
     },
 )
+
+# Safety-CRL v1 (2026-10-20): the PACE arm's rewards + three safety constraints (joint-limit excess, joint-limit
+# violation rate, non-foot contacts) with bounds measured on stochastic training-condition baseline rollouts.
+gym.register(
+    id="Unitree-G1-29dof-Running-SafetyCRL",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.running_safety_crl_env_cfg:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.running_safety_crl_env_cfg:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningSafetyCrlPPORunnerCfg",
+    },
+)
+
+# Safety-CRL v2 (2026-10-20; id without "-v2", gymnasium reads that as a version): v1 + commanded-torque limit (excess mean + over-limit prob), joint-velocity limit and
+# dangerous-tilt constraints, sim2real definitions, bounds at the baseline's stochastic training-condition level.
+gym.register(
+    id="Unitree-G1-29dof-Running-SafetyCRL2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.running_safety_crl_v2_env_cfg:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.running_safety_crl_v2_env_cfg:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:RunningSafetyCrlPPORunnerCfg",
+    },
+)
+
